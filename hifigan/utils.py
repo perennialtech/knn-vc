@@ -1,6 +1,5 @@
 import glob
 import os
-import shutil
 
 import torch
 from torch.nn.utils import weight_norm

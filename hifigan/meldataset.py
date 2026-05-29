@@ -1,5 +1,4 @@
 import math
-import os
 import random
 from pathlib import Path
 
@@ -12,7 +11,6 @@ import torch.utils.data
 import torchaudio
 from librosa.filters import mel as librosa_mel_fn
 from librosa.util import normalize
-from scipy.io.wavfile import read
 
 
 def load_wav(full_path):

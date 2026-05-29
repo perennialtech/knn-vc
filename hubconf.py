@@ -1,9 +1,6 @@
 dependencies = ['torch', 'torchaudio', 'numpy']
 
 import torch
-from torch import Tensor
-import torch.nn as nn
-import torch.nn.functional as F
 import logging
 import json
 from pathlib import Path

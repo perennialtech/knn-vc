@@ -1,7 +1,6 @@
 import argparse
 import gc
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -11,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-from fastprogress.fastprogress import master_bar, progress_bar
+from fastprogress.fastprogress import progress_bar
 from torch import Tensor
 
 from hubconf import wavlm_large
@@ -42,7 +41,7 @@ def main(args):
     print(f"Matching weightings: {MATCH_WEIGHTINGS.squeeze()}\nSynthesis weightings: {SYNTH_WEIGHTINGS.squeeze()}")
     ls_df = make_librispeech_df(Path(args.librispeech_path))
 
-    print(f"Loading wavlm.")
+    print("Loading wavlm.")
     wavlm = wavlm_large(pretrained=True, progress=True, device=args.device)
 
     np.random.seed(args.seed)

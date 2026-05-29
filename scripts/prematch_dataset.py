@@ -65,7 +65,7 @@ def main(args):
     LOGGER.info(f"Starting run with args {args}")
     df = make_df(Path(args.path), ext=args.ext)
 
-    LOGGER.info(f"Loading wavlm.")
+    LOGGER.info("Loading wavlm.")
     wavlm = init_wavlm_large(pretrained=True, progress=True, device=args.device)
     wavlm.extract_from_layer = args.layer
 
