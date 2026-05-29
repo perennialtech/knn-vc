@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 
 
-from wavlm.WavLM import WavLM, WavLMConfig
+from torchaudio.models import Wav2Vec2Model
 from hifigan.models import Generator as HiFiGAN
 from hifigan.utils import AttrDict
 from matcher import KNeighborsVC
+from wavlm.load_wavlm import init_wavlm_large
 
 
 def knn_vc(pretrained=True, progress=True, prematched=True, device='cuda') -> KNeighborsVC:
@@ -31,7 +32,7 @@ def hifigan_wavlm(pretrained=True, progress=True, prematched=True, device='cuda'
     device = torch.device(device)
 
     generator = HiFiGAN(h).to(device)
-    
+
     if pretrained:
         if prematched:
             url = "https://github.com/bshall/knn-vc/releases/download/v0.1/prematch_g_02500000.pt"
@@ -49,24 +50,6 @@ def hifigan_wavlm(pretrained=True, progress=True, prematched=True, device='cuda'
     return generator, h
 
 
-def wavlm_large(pretrained=True, progress=True, device='cuda') -> WavLM:
-    """Load the WavLM large checkpoint from the original paper. See https://github.com/microsoft/unilm/tree/master/wavlm for details. """
-    if torch.cuda.is_available() == False:
-        if str(device) != 'cpu':
-            logging.warning(f"Overriding device {device} to cpu since no GPU is available.")
-            device = 'cpu'
-    checkpoint = torch.hub.load_state_dict_from_url(
-        "https://github.com/bshall/knn-vc/releases/download/v0.1/WavLM-Large.pt", 
-        map_location=device, 
-        progress=progress
-    )
-    
-    cfg = WavLMConfig(checkpoint['cfg'])
-    device = torch.device(device)
-    model = WavLM(cfg)
-    if pretrained:
-        model.load_state_dict(checkpoint['model'])
-    model = model.to(device)
-    model.eval()
-    print(f"WavLM-Large loaded with {sum([p.numel() for p in model.parameters()]):,d} parameters.")
-    return model
+def wavlm_large(pretrained=True, progress=True, device='cuda') -> Wav2Vec2Model:
+    """Load the WavLM large checkpoint using torchaudio pipelines."""
+    return init_wavlm_large(pretrained=pretrained, progress=progress, device=device)

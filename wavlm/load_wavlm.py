@@ -1,25 +1,29 @@
 import torch
-from wavlm.WavLM import WavLM, WavLMConfig
+import logging
+from torchaudio.pipelines import WAVLM_LARGE
 
 
-def init_wavlm_large(pretrained=True, progress=True, device="cuda") -> WavLM:
+def init_wavlm_large(pretrained=True, progress=True, device="cuda"):
     """
-    Load the WavLM large checkpoint from the original paper.
-    See https://github.com/microsoft/unilm/tree/master/wavlm for details.
+    Load the WavLM large checkpoint from torchaudio pipelines.
+    This replaces the legacy unilm/fairseq implementation.
     """
-    checkpoint = torch.hub.load_state_dict_from_url(
-        "https://github.com/bshall/knn-vc/releases/download/v0.1/WavLM-Large.pt",
-        map_location=device,
-        progress=progress,
-    )
+    if not torch.cuda.is_available() and str(device) != 'cpu':
+        logging.getLogger("wavlm").warning(f"Overriding device {device} to cpu since no GPU is available.")
+        device = 'cpu'
 
-    cfg = WavLMConfig(checkpoint["cfg"])
-    device = torch.device(device)
-    model = WavLM(cfg)
     if pretrained:
-        model.load_state_dict(checkpoint["model"])
+        model = WAVLM_LARGE.get_model()
+    else:
+        model = WAVLM_LARGE.get_model()
+        model.apply(lambda m: hasattr(m, "reset_parameters") and m.reset_parameters())
+
+    model.extract_from_layer = 6
+
+    device = torch.device(device)
     model = model.to(device)
     model.eval()
+
     print(
         f"WavLM-Large loaded with {sum([p.numel() for p in model.parameters()]):,d} parameters."
     )

@@ -50,7 +50,7 @@ def main(args):
     print("All done!", flush=True)
 
 
-def path2pools(path: Path, wavlm: nn.Module(), match_weights: Tensor, synth_weights: Tensor, device):
+def path2pools(path: Path, wavlm: nn.Module, match_weights: Tensor, synth_weights: Tensor, device):
     """Given a waveform `path`, compute the matching pool"""
 
     uttrs_from_same_spk = sorted(list(path.parent.rglob('**/*.flac')))
@@ -88,8 +88,11 @@ def get_full_features(path, wavlm, device):
 
     # extract the representation of each layer
     wav_input_16khz = x.to(device)
-    rep, layer_results = wavlm.extract_features(wav_input_16khz, output_layer=wavlm.cfg.encoder_layers, ret_layer_results=True)[0]
-    features = torch.cat([x.transpose(0, 1) for x, _ in layer_results], dim=0) # (n_layers, seq_len, dim)
+    c, lengths = wavlm.feature_extractor(wav_input_16khz, None)
+    c = wavlm.encoder.feature_projection(c)
+    features_list, _ = wavlm.encoder.transformer.extract_features(c, lengths, num_layers=24)
+    all_layers = [c] + features_list
+    features = torch.cat(all_layers, dim=0) # (n_layers, seq_len, dim)
 
     return features
 
@@ -106,7 +109,7 @@ def fast_cosine_dist(source_feats, matching_pool):
 
 @torch.inference_mode()
 def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path: Path, synth_weights: Tensor, match_weights: Tensor):
-    
+
     pb = progress_bar(df.iterrows(), total=len(df))
 
     for i, row in pb:
@@ -143,9 +146,9 @@ def extract(df: pd.DataFrame, wavlm: nn.Module, device, ls_path: Path, out_path:
         else:
             pb.wait_for = min(pb.wait_for, 10)
         pb.comment = str(rel_path)
-        
 
-        if i % 1000 == 0: 
+
+        if i % 1000 == 0:
             print(f"Done {i:,d}/{len(df):,d}", flush=True)
             feature_cache.clear()
             synthesis_cache.clear()
@@ -168,4 +171,3 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(args)
-

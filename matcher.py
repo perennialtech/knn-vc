@@ -1,4 +1,3 @@
-
 from pathlib import Path
 
 import torch
@@ -9,8 +8,7 @@ import torchaudio.transforms as T
 from hifigan.models import Generator as HiFiGAN
 from hifigan.utils import AttrDict
 from torch import Tensor
-#from torchaudio.sox_effects import apply_effects_tensor
-from wavlm.WavLM import WavLM
+from torchaudio.models import Wav2Vec2Model
 from knnvc_utils import generate_matrix_from_index
 
 
@@ -32,12 +30,12 @@ def fast_cosine_dist(source_feats: Tensor, matching_pool: Tensor, device: str = 
 class KNeighborsVC(nn.Module):
 
     def __init__(self,
-        wavlm: WavLM,
+        wavlm: Wav2Vec2Model,
         hifigan: HiFiGAN,
         hifigan_cfg: AttrDict,
         device='cuda'
     ) -> None:
-        """ kNN-VC matcher. 
+        """ kNN-VC matcher.
         Arguments:
             - `wavlm` : trained WavLM model
             - `hifigan`: trained hifigan model
@@ -56,18 +54,18 @@ class KNeighborsVC(nn.Module):
         self.hop_length = 320
 
     def get_matching_set(self, wavs: list[Path] | list[Tensor], weights=None, vad_trigger_level=7) -> Tensor:
-        """ Get concatenated wavlm features for the matching set using all waveforms in `wavs`, 
-        specified as either a list of paths or list of loaded waveform tensors of 
+        """ Get concatenated wavlm features for the matching set using all waveforms in `wavs`,
+        specified as either a list of paths or list of loaded waveform tensors of
         shape (channels, T), assumed to be of 16kHz sample rate.
         Optionally specify custom WavLM feature weighting with `weights`.
         """
         feats = []
         for p in wavs:
             feats.append(self.get_features(p, weights=self.weighting if weights is None else weights, vad_trigger_level=vad_trigger_level))
-        
+
         feats = torch.concat(feats, dim=0).cpu()
         return feats
-        
+
 
     @torch.inference_mode()
     def vocode(self, c: Tensor) -> Tensor:
@@ -90,12 +88,12 @@ class KNeighborsVC(nn.Module):
             x: Tensor = path
             sr = self.sr
             if x.dim() == 1: x = x[None]
-                
+
         if not sr == self.sr :
             print(f"resample {sr} to {self.sr} in {path}")
             x = torchaudio.functional.resample(x, orig_freq=sr, new_freq=self.sr)
             sr = self.sr
-            
+
         # trim silence from front and back
         if vad_trigger_level > 1e-3:
             transform = T.Vad(sample_rate=sr, trigger_level=vad_trigger_level)
@@ -112,22 +110,25 @@ class KNeighborsVC(nn.Module):
 
         # extract the representation of each layer
         wav_input_16khz = x.to(self.device)
+
         if torch.allclose(weights, self.weighting):
             # use fastpath
-            features = self.wavlm.extract_features(wav_input_16khz, output_layer=SPEAKER_INFORMATION_LAYER, ret_layer_results=False)[0]
-            features = features.squeeze(0)
+            features_list, _ = self.wavlm.extract_features(wav_input_16khz, num_layers=SPEAKER_INFORMATION_LAYER)
+            features = features_list[SPEAKER_INFORMATION_LAYER - 1].squeeze(0)
         else:
             # use slower weighted
-            rep, layer_results = self.wavlm.extract_features(wav_input_16khz, output_layer=self.wavlm.cfg.encoder_layers, ret_layer_results=True)[0]
-            features = torch.cat([x.transpose(0, 1) for x, _ in layer_results], dim=0) # (n_layers, seq_len, dim)
+            c, lengths = self.wavlm.feature_extractor(wav_input_16khz, None)
+            c = self.wavlm.encoder.feature_projection(c)
+            features_list, _ = self.wavlm.encoder.transformer.extract_features(c, lengths, num_layers=24)
+            features = torch.cat([c] + features_list, dim=0) # (n_layers, seq_len, dim)
             # save full sequence
             features = ( features*weights[:, None] ).sum(dim=0) # (seq_len, dim)
-        
+
         return features
 
 
     @torch.inference_mode()
-    def match(self, query_seq: Tensor, matching_set: Tensor, synth_set: Tensor = None, 
+    def match(self, query_seq: Tensor, matching_set: Tensor, synth_set: Tensor = None,
               topk: int = 4, tgt_loudness_db: float | None = -16,
               target_duration: float | None = None, device: str | None = None) -> Tensor:
         """ Given `query_seq`, `matching_set`, and `synth_set` tensors of shape (N, dim), perform kNN regression matching
@@ -136,9 +137,9 @@ class KNeighborsVC(nn.Module):
             - `matching_set`: Tensor (N2, dim) of the matching set used as the 'training set' for the kNN algorithm.
             - `synth_set`: optional Tensor (N2, dim) corresponding to the matching set. We use the matching set to assign each query
                 vector to a vector in the matching set, and then use the corresponding vector from the synth set during HiFiGAN synthesis.
-                By default, and for best performance, this should be identical to the matching set. 
+                By default, and for best performance, this should be identical to the matching set.
             - `topk`: k in the kNN -- the number of nearest neighbors to average over.
-            - `tgt_loudness_db`: float db used to normalize the output volume. Set to None to disable. 
+            - `tgt_loudness_db`: float db used to normalize the output volume. Set to None to disable.
             - `target_duration`: if set to a float, interpolate resulting waveform duration to be equal to this value in seconds.
             - `device`: if None, uses default device at initialization. Otherwise uses specified device
         Returns:
@@ -158,9 +159,9 @@ class KNeighborsVC(nn.Module):
         dists = fast_cosine_dist(query_seq, matching_set, device=device)
         best = dists.topk(k=topk, largest=False, dim=-1)
         out_feats = synth_set[best.indices].mean(dim=1)
-        
+
         prediction = self.vocode(out_feats[None].to(device)).cpu().squeeze()
-        
+
         # normalization
         if tgt_loudness_db is not None:
             src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
@@ -168,5 +169,3 @@ class KNeighborsVC(nn.Module):
             pred_wav = torchaudio.functional.gain(prediction, tgt_loudness - src_loudness)
         else: pred_wav = prediction
         return pred_wav
-
-
