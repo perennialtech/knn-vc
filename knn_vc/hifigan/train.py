@@ -23,6 +23,17 @@ from .utils import AttrDict, load_checkpoint, scan_checkpoint
 torch.backends.cudnn.benchmark = True
 
 
+def get_commit_hash() -> str:
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
+            .decode("ascii")
+            .strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
 class Trainer:
     def __init__(self, config: AttrDict, logger: logging.Logger):
         self.config = config
@@ -37,7 +48,7 @@ class Trainer:
 
         # check if ckpt folder already exists and retrieve checkpoints
         os.makedirs(config.ckpt_path, exist_ok=True)
-        logger.info("checkpoints directory : ", config.ckpt_path)
+        logger.info(f"checkpoints directory: {config.ckpt_path}")
         if os.path.isdir(config.ckpt_path):
             cp_g = scan_checkpoint(config.ckpt_path, "g_")
             cp_do = scan_checkpoint(config.ckpt_path, "do_")
@@ -132,7 +143,8 @@ class Trainer:
                 # validation
                 if self.steps % self.config.validation_interval == 0:
                     self.generator.eval()
-                    torch.cuda.empty_cache()
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
                     val_err_tot = 0
                     n_batches = 0
                     with torch.no_grad():
@@ -150,17 +162,17 @@ class Trainer:
 
                     # go back to training
                     self.generator.train()
-                    self.tb_logger.add_scalar(
-                        "memory/max_allocated_gb",
-                        torch.cuda.max_memory_allocated() / 1e9,
-                        self.steps,
-                    )
-                    self.tb_logger.add_scalar(
-                        "memory/max_reserved_gb",
-                        torch.cuda.max_memory_reserved() / 1e9,
-                        self.steps,
-                    )
                     if self.device == "cuda":
+                        self.tb_logger.add_scalar(
+                            "memory/max_allocated_gb",
+                            torch.cuda.max_memory_allocated() / 1e9,
+                            self.steps,
+                        )
+                        self.tb_logger.add_scalar(
+                            "memory/max_reserved_gb",
+                            torch.cuda.max_memory_reserved() / 1e9,
+                            self.steps,
+                        )
                         torch.cuda.reset_peak_memory_stats()
                         torch.cuda.reset_accumulated_memory_stats()
 
@@ -186,7 +198,7 @@ class Trainer:
 
         return y, y_mel, y_g_hat, y_g_hat_mel
 
-    def train_batch(self, batch) -> tuple[Tensor, Tensor]:
+    def train_batch(self, batch) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         y, y_mel, y_g_hat, y_g_hat_mel = self.run_generator(batch)
 
         # run discriminator and compute its losses
@@ -239,7 +251,7 @@ class Trainer:
         # TODO: this shouldn't be needed
         if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
             self.logger.warning("Mismatching shapes between mel-spectrograms!")
-            n_pad = self.config.hop_size
+            n_pad = self.config.hifigan.hop_size
             y_g_hat = F.pad(y_g_hat, (n_pad // 2, n_pad - n_pad // 2))
             y_g_hat_mel = self.melspec(y_g_hat.squeeze(1))
 
@@ -256,6 +268,10 @@ class Trainer:
         with torch.no_grad():
             mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated() / 1e9 if self.device == "cuda" else 0.0
+        )
+
         # TB logs
         self.tb_logger.add_scalar("train/gen_loss_total", loss_gen_all, self.steps)
         self.tb_logger.add_scalar("train/mel_spec_error", mel_error, self.steps)
@@ -265,10 +281,10 @@ class Trainer:
         self.logger.info(
             "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, sec/batch : {:4.3f}, peak mem: {:5.2f}GB".format(
                 self.steps,
-                loss_gen_all,
+                loss_gen_all.item(),
                 mel_error,
                 time.time() - start_batch,
-                torch.cuda.max_memory_allocated() / 1e9,
+                peak_memory_gb,
             )
         )
 
@@ -336,30 +352,26 @@ def override_with_args(config: DictConfig, args: dict):
         sub_config[last_key] = value
 
 
-def main():
+def main(argv: list[str] | None = None):
 
     parser = argparse.ArgumentParser()
     parser.add_argument("config")
 
     # load args and config overrides
-    args, config_overrides = parser.parse_known_args()
+    args, config_overrides = parser.parse_known_args(argv)
     config = OmegaConf.load(args.config)
     override_with_args(config, config_overrides)
 
     # define logging directory
     config.ckpt_path = os.path.join(config.checkpoint_dir, str(int(time.time())))
-    os.makedirs(config.ckpt_path)
+    os.makedirs(config.ckpt_path, exist_ok=True)
 
     # add args to config
     for key, value in vars(args).items():
         config[key] = value
 
     # dump config with commit hash
-    config.commit_hash = (
-        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
-        .decode("ascii")
-        .strip()
-    )
+    config.commit_hash = get_commit_hash()
     OmegaConf.save(config, os.path.join(config.ckpt_path, "config.yaml"))
 
     # create logger
@@ -377,12 +389,13 @@ def main():
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
-        logger.info("Batch size:", config.batch_size)
+        logger.info(f"Batch size: {config.batch_size}")
         config.device = "cuda"
     else:
         logger.info("Batch size set to 1 for CPU")
         config.batch_size = 1
         config.device = "cpu"
+        config.fp16 = False
 
     Trainer(config, logger)
 

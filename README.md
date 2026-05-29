@@ -27,7 +27,7 @@ Authors:
 
 ## Setup
 
-This repository uses `uv` for local workflows. Install `uv` from the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/), then sync the environment from `pyproject.toml` and `uv.lock`:
+This repository uses `uv` for local workflows. Install `uv` from the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/), then sync the environment from `pyproject.toml` and `uv.lock`. This installs the local `knn_vc` package into the environment:
 
 ```bash
 uv sync
@@ -36,7 +36,7 @@ uv sync
 Run repository commands through `uv run`:
 
 ```bash
-uv run python -m hifigan.train hifigan/config.yaml
+uv run knn-vc-train-hifigan knn_vc/hifigan/config.yaml
 ```
 
 For development hooks:
@@ -50,20 +50,15 @@ The project metadata, Python requirement, runtime dependencies, and development 
 
 ## Quickstart
 
-You can load the updated model seamlessly via `torch.hub` without cloning this repository:
-
-Load the WavLM encoder and HiFi-GAN vocoder:
+Load the WavLM encoder and HiFi-GAN vocoder from the installed package:
 
 ```python
-import torch
-import torchaudio
+from knn_vc import load_knn_vc
 
-knn_vc = torch.hub.load(
-    "perennialtech/knn-vc",
-    "knn_vc",
+knn_vc = load_knn_vc(
     prematched=True,
-    trust_repo=True,
     pretrained=True,
+    device="cuda",
 )
 ```
 
@@ -128,27 +123,16 @@ The original kNN-VC procedure supports generating either regular WavLM features 
 Example:
 
 ```bash
-uv run python prematch_dataset.py \
-  --librispeech_path /path/to/librispeech/root \
-  --out_path /path/where/you/want/outputs/to/go \
+uv run knn-vc-prematch \
+  /path/to/librispeech/root \
+  /path/where/you/want/outputs/to/go \
   --topk 4 \
   --matching_layer 6 \
   --synthesis_layer 6 \
   --prematch
 ```
 
-Newer helper scripts may expose a simplified single-layer option:
-
-```bash
-uv run python scripts/prematch_dataset.py \
-  --librispeech_path /path/to/librispeech/root \
-  --out_path /path/where/you/want/outputs/to/go \
-  --topk 4 \
-  --layer 6 \
-  --prematch
-```
-
-Use the interface that matches the script you are running.
+Use `--synthesis_layer 6 --matching_layer 6` for the original single-layer recipe.
 
 #### 2. Create WebDataset shards
 
@@ -157,11 +141,11 @@ To improve training efficiency, this fork can pack the audio and SSL features in
 Example:
 
 ```bash
-uv run python scripts/create_webdataset.py \
-  output_dir=ls-dev-clean_prematch \
-  audio_dir=/cfs/collections/librispeech/LibriSpeech/dev-clean/ \
-  ssl_dir=librispeech_prematch/dev-clean/ \
-  n_tars=20
+uv run knn-vc-create-webdataset \
+  ls-dev-clean_prematch \
+  /cfs/collections/librispeech/LibriSpeech/dev-clean/ \
+  librispeech_prematch/dev-clean/ \
+  20
 ```
 
 The WebDataset path reduces filesystem overhead, especially on networked filesystems, and has reduced training time by roughly 25% in observed runs.
@@ -173,7 +157,7 @@ This repository adapts the original [HiFi-GAN](https://github.com/jik876/hifi-ga
 The training entrypoint is:
 
 ```bash
-uv run python -m hifigan.train hifigan/config.yaml
+uv run knn-vc-train-hifigan knn_vc/hifigan/config.yaml
 ```
 
 Training can be stopped once it reaches around 2.5M updates, or earlier if audio quality begins to degrade.

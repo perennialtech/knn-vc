@@ -528,7 +528,7 @@ def main(args: argparse.Namespace) -> None:
     LOGGER.info("All done!")
 
 
-if __name__ == "__main__":
+def main_cli(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Compute optionally pre-matched WavLM features for a dataset"
     )
@@ -558,4 +558,8 @@ if __name__ == "__main__":
         help="Number of source frames to match at once during pre-matching",
     )
 
-    main(parser.parse_args())
+    main(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    main_cli()

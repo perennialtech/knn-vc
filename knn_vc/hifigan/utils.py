@@ -24,7 +24,14 @@ def get_padding(kernel_size, dilation=1):
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)
     print("Loading '{}'".format(filepath))
-    checkpoint_dict = torch.load(filepath, map_location=device)
+    try:
+        checkpoint_dict = torch.load(
+            filepath,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        checkpoint_dict = torch.load(filepath, map_location=device)
     print("Complete.")
     return checkpoint_dict
 

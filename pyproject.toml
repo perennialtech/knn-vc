@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "knn-vc"
 version = "0.1.0"
@@ -18,6 +22,8 @@ dependencies = [
   "torch>=2.9,<2.10",
   "torchcodec>=0.9,<0.10",
   "torchaudio>=2.9,<2.10",
+  "librosa>=0.11,<0.12",
+  "fastprogress>=1.0,<2",
   "tqdm>=4.67,<5",
   "tensorboard>=2.20,<2.21",
   "omegaconf>=2.3,<2.4",
@@ -30,6 +36,17 @@ Repository = "https://github.com/perennialtech/knn-vc"
 Paper = "https://arxiv.org/abs/2305.18975"
 Demo = "https://bshall.github.io/knn-vc/"
 
+[project.scripts]
+knn-vc-create-webdataset = "knn_vc.tools.create_webdataset:main"
+knn-vc-prematch = "knn_vc.tools.prematch_dataset:main_cli"
+knn-vc-train-hifigan = "knn_vc.hifigan.train:main"
+
+[tool.setuptools.packages.find]
+include = ["knn_vc*"]
+
+[tool.setuptools.package-data]
+"knn_vc.hifigan" = ["*.json", "*.yaml"]
+
 [dependency-groups]
 dev = [
   "basedpyright>=1.39.0",
@@ -38,11 +55,12 @@ dev = [
   "mypy>=2.1.0",
   "nbstripout>=0.9.0",
   "pre-commit>=4.5.1",
+  "pytest>=9.0,<10",
   "ruff>=0.14.11",
 ]
 
 [tool.uv]
-package = false
+package = true
 
 [tool.ruff]
 target-version = "py311"
@@ -52,6 +70,7 @@ line-length = 88
 ignore = [
   "E712",
   "E731",
+  "E741",
 ]
 
 [tool.ruff.format]

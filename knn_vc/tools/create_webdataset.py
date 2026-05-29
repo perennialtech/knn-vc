@@ -58,14 +58,18 @@ def prepare_shards(
         writer.close()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Create sharded WebDataset")
     parser.add_argument("output_dir", help="Directory to save .tar files")
     parser.add_argument("audio_dir")
     parser.add_argument("ssl_dir")
     parser.add_argument("n_tars", type=int, help="Number of shards to create")
     parser.add_argument("--ext", default=".flac", type=str)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     prepare_shards(args.output_dir, args.audio_dir, args.ssl_dir, args.n_tars, args.ext)
     print(f"\nDone! Shards are located in: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

@@ -19,7 +19,13 @@ def init_wavlm_large(pretrained=True, progress=True, device="cuda"):
         model = WAVLM_LARGE.get_model()
     else:
         model = WAVLM_LARGE.get_model()
-        model.apply(lambda m: hasattr(m, "reset_parameters") and m.reset_parameters())
+
+        def reset_parameters(module):
+            reset = getattr(module, "reset_parameters", None)
+            if callable(reset):
+                reset()
+
+        model.apply(reset_parameters)
 
     model.extract_from_layer = 6
 

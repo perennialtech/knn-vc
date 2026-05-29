@@ -29,11 +29,11 @@ class WdsAudioDecoder:
 
 def is_not_metadata(sample: str) -> bool:
     fname = sample["__key__"].split("/")[-1]
-    if len(fname) == 0:
+    if not fname:
         return False
 
     first_underscore = fname[0] == "_"
-    second_underscore = fname[1] == "_"
+    second_underscore = len(fname) > 1 and fname[1] == "_"
 
     is_metadata = first_underscore and not second_underscore
     return not is_metadata
@@ -45,9 +45,12 @@ def create_dataloader(
     logger: logging.Logger,
     shuffle: bool = True,
 ) -> DataLoader:
-    tar_paths = [
+    tar_paths = sorted(
         os.path.join(tar_dir, f) for f in os.listdir(tar_dir) if f.endswith(".tar")
-    ]
+    )
+    if not tar_paths:
+        raise FileNotFoundError(f"No .tar shards found in {tar_dir}")
+
     logger.info(
         f"Creating dataloader with {len(tar_paths)} tar files and shuffle={shuffle}"
     )
@@ -77,7 +80,7 @@ def create_dataloader(
         num_workers=n_workers,
         batch_size=config.batch_size,
         pin_memory=config.device == "cuda",
-        persistent_workers=config.num_workers > 0,
+        persistent_workers=n_workers > 0,
     )
 
 
