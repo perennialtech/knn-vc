@@ -102,7 +102,9 @@ def get_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
         c, lengths = wavlm.feature_extractor(x, None)
         features = wavlm.encoder.feature_projection(c)
     else:
-        features_list, _ = wavlm.extract_features(x, num_layers=wavlm.extract_from_layer)
+        features_list, _ = wavlm.extract_features(
+            x, num_layers=wavlm.extract_from_layer
+        )
         features = features_list[-1]
 
     return features

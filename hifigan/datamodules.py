@@ -46,9 +46,7 @@ def create_dataloader(
     shuffle: bool = True,
 ) -> DataLoader:
     tar_paths = [
-        os.path.join(tar_dir, f)
-        for f in os.listdir(tar_dir)
-        if f.endswith(".tar")
+        os.path.join(tar_dir, f) for f in os.listdir(tar_dir) if f.endswith(".tar")
     ]
     logger.info(
         f"Creating dataloader with {len(tar_paths)} tar files and shuffle={shuffle}"

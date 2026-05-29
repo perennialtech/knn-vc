@@ -11,31 +11,37 @@ from torch import Tensor
 from torchaudio.models import Wav2Vec2Model
 from knnvc_utils import generate_matrix_from_index
 
-
 SPEAKER_INFORMATION_LAYER = 6
 SPEAKER_INFORMATION_WEIGHTS = generate_matrix_from_index(SPEAKER_INFORMATION_LAYER)
 
 
-def fast_cosine_dist(source_feats: Tensor, matching_pool: Tensor, device: str = 'cpu') -> Tensor:
-    """ Like torch.cdist, but fixed dim=-1 and for cosine distance."""
+def fast_cosine_dist(
+    source_feats: Tensor, matching_pool: Tensor, device: str = "cpu"
+) -> Tensor:
+    """Like torch.cdist, but fixed dim=-1 and for cosine distance."""
     source_norms = torch.norm(source_feats, p=2, dim=-1).to(device)
     matching_norms = torch.norm(matching_pool, p=2, dim=-1)
-    dotprod = -torch.cdist(source_feats[None].to(device), matching_pool[None], p=2)[0]**2 + source_norms[:, None]**2 + matching_norms[None]**2
+    dotprod = (
+        -torch.cdist(source_feats[None].to(device), matching_pool[None], p=2)[0] ** 2
+        + source_norms[:, None] ** 2
+        + matching_norms[None] ** 2
+    )
     dotprod /= 2
 
-    dists = 1 - ( dotprod / (source_norms[:, None] * matching_norms[None]) )
+    dists = 1 - (dotprod / (source_norms[:, None] * matching_norms[None]))
     return dists
 
 
 class KNeighborsVC(nn.Module):
 
-    def __init__(self,
+    def __init__(
+        self,
         wavlm: Wav2Vec2Model,
         hifigan: HiFiGAN,
         hifigan_cfg: AttrDict,
-        device='cuda'
+        device="cuda",
     ) -> None:
-        """ kNN-VC matcher.
+        """kNN-VC matcher.
         Arguments:
             - `wavlm` : trained WavLM model
             - `hifigan`: trained hifigan model
@@ -43,7 +49,9 @@ class KNeighborsVC(nn.Module):
         """
         super().__init__()
         # set which features to extract from wavlm
-        self.weighting = torch.tensor(SPEAKER_INFORMATION_WEIGHTS, device=device)[:, None]
+        self.weighting = torch.tensor(SPEAKER_INFORMATION_WEIGHTS, device=device)[
+            :, None
+        ]
         # load hifigan
         self.hifigan = hifigan.eval()
         self.h = hifigan_cfg
@@ -53,27 +61,33 @@ class KNeighborsVC(nn.Module):
         self.sr = self.h.sampling_rate
         self.hop_length = 320
 
-    def get_matching_set(self, wavs: list[Path] | list[Tensor], weights=None, vad_trigger_level=7) -> Tensor:
-        """ Get concatenated wavlm features for the matching set using all waveforms in `wavs`,
+    def get_matching_set(
+        self, wavs: list[Path] | list[Tensor], weights=None, vad_trigger_level=7
+    ) -> Tensor:
+        """Get concatenated wavlm features for the matching set using all waveforms in `wavs`,
         specified as either a list of paths or list of loaded waveform tensors of
         shape (channels, T), assumed to be of 16kHz sample rate.
         Optionally specify custom WavLM feature weighting with `weights`.
         """
         feats = []
         for p in wavs:
-            feats.append(self.get_features(p, weights=self.weighting if weights is None else weights, vad_trigger_level=vad_trigger_level))
+            feats.append(
+                self.get_features(
+                    p,
+                    weights=self.weighting if weights is None else weights,
+                    vad_trigger_level=vad_trigger_level,
+                )
+            )
 
         feats = torch.concat(feats, dim=0).cpu()
         return feats
 
-
     @torch.inference_mode()
     def vocode(self, c: Tensor) -> Tensor:
-        """ Vocode features with hifigan. `c` is of shape (bs, seq_len, c_dim) """
+        """Vocode features with hifigan. `c` is of shape (bs, seq_len, c_dim)"""
         y_g_hat = self.hifigan(c)
         y_g_hat = y_g_hat.squeeze(1)
         return y_g_hat
-
 
     @torch.inference_mode()
     def get_features(self, path, weights=None, vad_trigger_level=0):
@@ -81,15 +95,17 @@ class KNeighborsVC(nn.Module):
         on start/end with `vad_trigger_level`.
         """
         # load audio
-        if weights == None: weights = self.weighting
+        if weights == None:
+            weights = self.weighting
         if type(path) in [str, Path]:
             x, sr = torchaudio.load(path, normalize=True)
         else:
             x: Tensor = path
             sr = self.sr
-            if x.dim() == 1: x = x[None]
+            if x.dim() == 1:
+                x = x[None]
 
-        if not sr == self.sr :
+        if not sr == self.sr:
             print(f"resample {sr} to {self.sr} in {path}")
             x = torchaudio.functional.resample(x, orig_freq=sr, new_freq=self.sr)
             sr = self.sr
@@ -99,13 +115,13 @@ class KNeighborsVC(nn.Module):
             transform = T.Vad(sample_rate=sr, trigger_level=vad_trigger_level)
             x_front_trim = transform(x)
             # original way, disabled because it lacks windows support
-            #waveform_reversed, sr = apply_effects_tensor(x_front_trim, sr, [["reverse"]])
+            # waveform_reversed, sr = apply_effects_tensor(x_front_trim, sr, [["reverse"]])
             waveform_reversed = torch.flip(x_front_trim, (-1,))
             waveform_reversed_front_trim = transform(waveform_reversed)
             waveform_end_trim = torch.flip(waveform_reversed_front_trim, (-1,))
-            #waveform_end_trim, sr = apply_effects_tensor(
+            # waveform_end_trim, sr = apply_effects_tensor(
             #    waveform_reversed_front_trim, sr, [["reverse"]]
-            #)
+            # )
             x = waveform_end_trim
 
         # extract the representation of each layer
@@ -113,25 +129,35 @@ class KNeighborsVC(nn.Module):
 
         if torch.allclose(weights, self.weighting):
             # use fastpath
-            features_list, _ = self.wavlm.extract_features(wav_input_16khz, num_layers=SPEAKER_INFORMATION_LAYER)
+            features_list, _ = self.wavlm.extract_features(
+                wav_input_16khz, num_layers=SPEAKER_INFORMATION_LAYER
+            )
             features = features_list[SPEAKER_INFORMATION_LAYER - 1].squeeze(0)
         else:
             # use slower weighted
             c, lengths = self.wavlm.feature_extractor(wav_input_16khz, None)
             c = self.wavlm.encoder.feature_projection(c)
-            features_list, _ = self.wavlm.encoder.transformer.extract_features(c, lengths, num_layers=24)
-            features = torch.cat([c] + features_list, dim=0) # (n_layers, seq_len, dim)
+            features_list, _ = self.wavlm.encoder.transformer.extract_features(
+                c, lengths, num_layers=24
+            )
+            features = torch.cat([c] + features_list, dim=0)  # (n_layers, seq_len, dim)
             # save full sequence
-            features = ( features*weights[:, None] ).sum(dim=0) # (seq_len, dim)
+            features = (features * weights[:, None]).sum(dim=0)  # (seq_len, dim)
 
         return features
 
-
     @torch.inference_mode()
-    def match(self, query_seq: Tensor, matching_set: Tensor, synth_set: Tensor = None,
-              topk: int = 4, tgt_loudness_db: float | None = -16,
-              target_duration: float | None = None, device: str | None = None) -> Tensor:
-        """ Given `query_seq`, `matching_set`, and `synth_set` tensors of shape (N, dim), perform kNN regression matching
+    def match(
+        self,
+        query_seq: Tensor,
+        matching_set: Tensor,
+        synth_set: Tensor = None,
+        topk: int = 4,
+        tgt_loudness_db: float | None = -16,
+        target_duration: float | None = None,
+        device: str | None = None,
+    ) -> Tensor:
+        """Given `query_seq`, `matching_set`, and `synth_set` tensors of shape (N, dim), perform kNN regression matching
         with k=`topk`. Inputs:
             - `query_seq`: Tensor (N1, dim) of the input/source query features.
             - `matching_set`: Tensor (N2, dim) of the matching set used as the 'training set' for the kNN algorithm.
@@ -146,15 +172,21 @@ class KNeighborsVC(nn.Module):
             - converted waveform of shape (T,)
         """
         device = torch.device(device) if device is not None else self.device
-        if synth_set is None: synth_set = matching_set.to(device)
-        else: synth_set = synth_set.to(device)
+        if synth_set is None:
+            synth_set = matching_set.to(device)
+        else:
+            synth_set = synth_set.to(device)
         matching_set = matching_set.to(device)
         query_seq = query_seq.to(device)
 
         if target_duration is not None:
-            target_samples = int(target_duration*self.sr)
-            scale_factor = (target_samples/self.hop_length) / query_seq.shape[0] # n_targ_feats / n_input_feats
-            query_seq = F.interpolate(query_seq.T[None], scale_factor=scale_factor, mode='linear')[0].T
+            target_samples = int(target_duration * self.sr)
+            scale_factor = (target_samples / self.hop_length) / query_seq.shape[
+                0
+            ]  # n_targ_feats / n_input_feats
+            query_seq = F.interpolate(
+                query_seq.T[None], scale_factor=scale_factor, mode="linear"
+            )[0].T
 
         dists = fast_cosine_dist(query_seq, matching_set, device=device)
         best = dists.topk(k=topk, largest=False, dim=-1)
@@ -164,8 +196,13 @@ class KNeighborsVC(nn.Module):
 
         # normalization
         if tgt_loudness_db is not None:
-            src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
+            src_loudness = torchaudio.functional.loudness(
+                prediction[None], self.h.sampling_rate
+            )
             tgt_loudness = tgt_loudness_db
-            pred_wav = torchaudio.functional.gain(prediction, tgt_loudness - src_loudness)
-        else: pred_wav = prediction
+            pred_wav = torchaudio.functional.gain(
+                prediction, tgt_loudness - src_loudness
+            )
+        else:
+            pred_wav = prediction
         return pred_wav

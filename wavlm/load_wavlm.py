@@ -8,9 +8,11 @@ def init_wavlm_large(pretrained=True, progress=True, device="cuda"):
     Load the WavLM large checkpoint from torchaudio pipelines.
     This replaces the legacy unilm/fairseq implementation.
     """
-    if not torch.cuda.is_available() and str(device) != 'cpu':
-        logging.getLogger("wavlm").warning(f"Overriding device {device} to cpu since no GPU is available.")
-        device = 'cpu'
+    if not torch.cuda.is_available() and str(device) != "cpu":
+        logging.getLogger("wavlm").warning(
+            f"Overriding device {device} to cpu since no GPU is available."
+        )
+        device = "cpu"
 
     if pretrained:
         model = WAVLM_LARGE.get_model()

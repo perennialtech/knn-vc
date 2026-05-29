@@ -150,9 +150,7 @@ class Trainer:
 
                     # log avg. mel-spech error on the validation set
                     val_err = val_err_tot / n_batches
-                    self.tb_logger.add_scalar(
-                        "val/mel_spec_error", val_err, self.steps
-                    )
+                    self.tb_logger.add_scalar("val/mel_spec_error", val_err, self.steps)
                     self.logger.info(
                         f"val. done at {self.steps:,d} steps. mel spec error: {val_err:5.4f}"
                     )
