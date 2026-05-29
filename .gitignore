@@ -140,3 +140,5 @@ dmypy.json
 *.tar
 cp_hifigan/
 logs/
+
+cartesia_tts_out
