@@ -17,17 +17,27 @@ authors = [
 ]
 
 dependencies = [
-  "numpy>=2,<3",
-  "pandas>=2.3,<2.4",
-  "torch>=2.9,<2.10",
-  "torchcodec>=0.9,<0.10",
-  "torchaudio>=2.9,<2.10",
-  "librosa>=0.11,<0.12",
+  "fastapi[standard]>=0.136.3",
   "fastprogress>=1.0,<2",
-  "tqdm>=4.67,<5",
-  "tensorboard>=2.20,<2.21",
+  "librosa>=0.11,<0.12",
+  "numpy>=2,<3",
   "omegaconf>=2.3,<2.4",
+  "pandas>=2.3,<2.4",
+  "tensorboard>=2.20,<2.21",
+  "tqdm>=4.67,<5",
   "webdataset>=1.0,<1.1",
+]
+
+[project.optional-dependencies]
+cpu = [
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+  "torchcodec==0.10.0",
+]
+cuda = [
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+  "torchcodec==0.10.0",
 ]
 
 [project.urls]
@@ -65,6 +75,36 @@ exclude = ["**/*.ipynb"]
 
 [tool.uv]
 package = true
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cuda" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cuda" },
+]
+torchcodec = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cuda" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 target-version = "py311"

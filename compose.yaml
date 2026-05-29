@@ -1,0 +1,13 @@
+services:
+  knn-vc:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - knn-vc-data:/data
+    environment:
+      - KNN_VC_DATA_DIR=/data/knn_vc
+      - TORCH_HOME=/data/torch
+
+volumes:
+  knn-vc-data:

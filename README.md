@@ -27,10 +27,20 @@ Authors:
 
 ## Setup
 
-This repository uses `uv` for local workflows. Install `uv` from the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/), then sync the environment from `pyproject.toml` and `uv.lock`. This installs the local `knn_vc` package into the environment:
+This repository uses `uv` for local workflows. Install `uv` from the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/), then sync the environment from `pyproject.toml` and `uv.lock`.
+
+Choose exactly one PyTorch backend extra.
+
+For CUDA:
 
 ```bash
-uv sync
+uv sync --extra cuda
+```
+
+For CPU-only:
+
+```bash
+uv sync --extra cpu
 ```
 
 Run repository commands through `uv run`:
@@ -42,11 +52,11 @@ uv run knn-vc-train-hifigan knn_vc/hifigan/config.yaml
 For development hooks:
 
 ```bash
-uv sync --group dev
+uv sync --extra cuda --group dev
 uv run pre-commit install
 ```
 
-The project metadata, Python requirement, runtime dependencies, and development dependency group are maintained in `pyproject.toml`.
+The project metadata, Python requirement, runtime dependencies, backend extras, and development dependency group are maintained in `pyproject.toml`.
 
 ## Quickstart
 
@@ -61,6 +71,8 @@ knn_vc = load_knn_vc(
     device="cuda",
 )
 ```
+
+Use `device="cpu"` with the CPU-only backend.
 
 To use the vocoder trained without prematched data, set `prematched=False`.
 
@@ -103,6 +115,36 @@ Performance on the LibriSpeech dev-clean set:
 | ----------------------------------------------------------------------------------------------------------------- | :-----: | :-----: | :-----: |
 | [kNN-VC with prematched HiFi-GAN](https://github.com/bshall/knn-vc/releases/download/v0.1/prematch_g_02500000.pt) |  6.29   |  2.34   |  35.73  |
 | [kNN-VC with regular HiFi-GAN](https://github.com/bshall/knn-vc/releases/download/v0.1/g_02500000.pt)             |  6.39   |  2.41   |  32.55  |
+
+## REST API server
+
+A FastAPI server is available to manage reference voices and perform voice conversion over HTTP. You can run it either inside a Docker container or directly on your host machine.
+
+### Running locally with `uv`
+
+To run the server directly on your host machine without Docker, use the built-in FastAPI CLI via `uv`:
+
+```bash
+# For development with auto-reload:
+uv run fastapi dev knn_vc/server.py
+
+# For production:
+uv run fastapi run knn_vc/server.py --port 8000
+```
+
+By default, reference voices are saved to a `./data/voices` directory. You can change this by setting the `KNN_VC_DATA_DIR` environment variable.
+
+### Running with Docker Compose
+
+To launch the server using Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+### Using the API
+
+Once running, navigate to `http://localhost:8000/docs` in your browser to view the interactive API documentation and test the available endpoints.
 
 ## Training
 
