@@ -1,11 +1,11 @@
 dependencies = ["torch", "torchaudio", "numpy"]
 
-import torch
 import json
 from pathlib import Path
 
-
+import torch
 from torchaudio.models import Wav2Vec2Model
+
 from hifigan.models import Generator as HiFiGAN
 from hifigan.utils import AttrDict
 from matcher import KNeighborsVC

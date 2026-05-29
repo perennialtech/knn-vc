@@ -1,17 +1,17 @@
-import math
-import random
-from io import BytesIO
-from dataclasses import dataclass
 import logging
+import math
 import os
+import random
+from dataclasses import dataclass
+from io import BytesIO
 
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from torchcodec.decoders import AudioDecoder
-from omegaconf import DictConfig
 import webdataset as wds
+from omegaconf import DictConfig
+from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
+from torchcodec.decoders import AudioDecoder
 
 
 def decode_pt(pt: bytes) -> Tensor:
