@@ -1,7 +1,7 @@
 [project]
 name = "knn-vc"
 version = "0.1.0"
-description = "Voice conversion with just nearest neighbors, plus modernized HiFi-GAN vocoder training."
+description = "Voice conversion with just nearest neighbors."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
