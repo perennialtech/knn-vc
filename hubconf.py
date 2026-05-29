@@ -1,7 +1,6 @@
 dependencies = ["torch", "torchaudio", "numpy"]
 
 import torch
-import logging
 import json
 from pathlib import Path
 

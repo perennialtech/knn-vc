@@ -50,7 +50,7 @@ The project metadata, Python requirement, runtime dependencies, and development 
 
 ## Quickstart
 
-The original `torch.hub` inference quickstart remains available without cloning this repository.
+You can load the updated model seamlessly via `torch.hub` without cloning this repository:
 
 Load the WavLM encoder and HiFi-GAN vocoder:
 
@@ -59,7 +59,7 @@ import torch
 import torchaudio
 
 knn_vc = torch.hub.load(
-    "bshall/knn-vc",
+    "perennialtech/knn-vc",
     "knn_vc",
     prematched=True,
     trust_repo=True,
@@ -94,9 +94,9 @@ The target speaker from `ref_wav_paths` can be any speaker, but the reference au
 
 ## Checkpoints
 
-The original kNN-VC release provides three checkpoints:
+The original kNN-VC release provides three checkpoints (the WavLM checkpoint is now natively downloaded via `torchaudio.pipelines`):
 
-- The frozen WavLM encoder from the [original WavLM authors](https://github.com/microsoft/unilm/tree/master/wavlm), hosted for convenience and torch hub integration.
+- The WavLM encoder is loaded natively via `torchaudio.pipelines.WAVLM_LARGE`.
 - The HiFi-GAN vocoder trained on layer 6 of WavLM features.
 - The HiFi-GAN vocoder trained on prematched layer 6 of WavLM features, which is the best model in the paper.
 

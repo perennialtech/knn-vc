@@ -5,14 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
-from hifigan.models import Generator as HiFiGAN
-from hifigan.utils import AttrDict
 from torch import Tensor
 from torchaudio.models import Wav2Vec2Model
-from knnvc_utils import generate_matrix_from_index
+
+from hifigan.models import Generator as HiFiGAN
+from hifigan.utils import AttrDict
 
 SPEAKER_INFORMATION_LAYER = 6
-SPEAKER_INFORMATION_WEIGHTS = generate_matrix_from_index(SPEAKER_INFORMATION_LAYER)
 
 
 def fast_cosine_dist(
@@ -22,7 +21,7 @@ def fast_cosine_dist(
     source_norms = torch.norm(source_feats, p=2, dim=-1).to(device)
     matching_norms = torch.norm(matching_pool, p=2, dim=-1)
     dotprod = (
-        -torch.cdist(source_feats[None].to(device), matching_pool[None], p=2)[0] ** 2
+        -(torch.cdist(source_feats[None].to(device), matching_pool[None], p=2)[0] ** 2)
         + source_norms[:, None] ** 2
         + matching_norms[None] ** 2
     )
@@ -33,7 +32,6 @@ def fast_cosine_dist(
 
 
 class KNeighborsVC(nn.Module):
-
     def __init__(
         self,
         wavlm: Wav2Vec2Model,
@@ -48,10 +46,6 @@ class KNeighborsVC(nn.Module):
             - `hifigan_cfg`: hifigan config to use for vocoding.
         """
         super().__init__()
-        # set which features to extract from wavlm
-        self.weighting = torch.tensor(SPEAKER_INFORMATION_WEIGHTS, device=device)[
-            :, None
-        ]
         # load hifigan
         self.hifigan = hifigan.eval()
         self.h = hifigan_cfg
@@ -62,19 +56,22 @@ class KNeighborsVC(nn.Module):
         self.hop_length = 320
 
     def get_matching_set(
-        self, wavs: list[Path] | list[Tensor], weights=None, vad_trigger_level=7
+        self,
+        wavs: list[Path] | list[Tensor],
+        layer: int = SPEAKER_INFORMATION_LAYER,
+        vad_trigger_level=7,
     ) -> Tensor:
         """Get concatenated wavlm features for the matching set using all waveforms in `wavs`,
         specified as either a list of paths or list of loaded waveform tensors of
         shape (channels, T), assumed to be of 16kHz sample rate.
-        Optionally specify custom WavLM feature weighting with `weights`.
+        Optionally specify custom WavLM feature extraction layer with `layer`.
         """
         feats = []
         for p in wavs:
             feats.append(
                 self.get_features(
                     p,
-                    weights=self.weighting if weights is None else weights,
+                    layer=layer,
                     vad_trigger_level=vad_trigger_level,
                 )
             )
@@ -90,13 +87,13 @@ class KNeighborsVC(nn.Module):
         return y_g_hat
 
     @torch.inference_mode()
-    def get_features(self, path, weights=None, vad_trigger_level=0):
+    def get_features(
+        self, path, layer: int = SPEAKER_INFORMATION_LAYER, vad_trigger_level=0
+    ):
         """Returns features of `path` waveform as a tensor of shape (seq_len, dim), optionally perform VAD trimming
         on start/end with `vad_trigger_level`.
         """
         # load audio
-        if weights == None:
-            weights = self.weighting
         if type(path) in [str, Path]:
             x, sr = torchaudio.load(path, normalize=True)
         else:
@@ -127,22 +124,14 @@ class KNeighborsVC(nn.Module):
         # extract the representation of each layer
         wav_input_16khz = x.to(self.device)
 
-        if torch.allclose(weights, self.weighting):
-            # use fastpath
-            features_list, _ = self.wavlm.extract_features(
-                wav_input_16khz, num_layers=SPEAKER_INFORMATION_LAYER
-            )
-            features = features_list[SPEAKER_INFORMATION_LAYER - 1].squeeze(0)
+        if layer == 0:
+            c, _ = self.wavlm.feature_extractor(wav_input_16khz, None)
+            features = self.wavlm.encoder.feature_projection(c).squeeze(0)
         else:
-            # use slower weighted
-            c, lengths = self.wavlm.feature_extractor(wav_input_16khz, None)
-            c = self.wavlm.encoder.feature_projection(c)
-            features_list, _ = self.wavlm.encoder.transformer.extract_features(
-                c, lengths, num_layers=24
+            features_list, _ = self.wavlm.extract_features(
+                wav_input_16khz, num_layers=layer
             )
-            features = torch.cat([c] + features_list, dim=0)  # (n_layers, seq_len, dim)
-            # save full sequence
-            features = (features * weights[:, None]).sum(dim=0)  # (seq_len, dim)
+            features = features_list[-1].squeeze(0)
 
         return features
 

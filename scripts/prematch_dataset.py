@@ -1,28 +1,32 @@
 """
-! If torchcodec cannot find ffmpeg: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+Extract and optionally pre-match WavLM audio features for a dataset of utterances.
 
-This script extracts and pre-matches WavLM audio features from a dataset of utterances.
+The script expects files whose speaker id can be read from the filename prefix before
+the first dash, for example LibriSpeech-style files like:
 
-Pre-matching refers to a kNN regression across utterances from the same speaker to
-create matched feature pairs, similar to those you would get from a real conversion
-step on inference. Given a speaker's utterances, `prematch_feats`, for each utterance,
+    1089-134686-0000.flac
 
-- finds the k nearest features from all *other* utterances of the same speaker
-- Averages those k nearest neighbors to create a matched representation
+Pre-matching is a kNN regression performed within each speaker. For every utterance,
+each frame searches for nearest frames from all other utterances by the same speaker.
+The nearest neighbors are selected using the matching layer, then averaged using the
+synthesis layer. This lets you match in one WavLM layer while saving features from
+another.
 
-For speakers with a lot of data, the data is split into chunks to avoid memory issues
-while maintaining independent pre-matching within chunks. You can define how to chunk
-the speaker's data with MAX_VECTORS_FOR_PREMATCH.
+Layer numbering:
 
-With MIN_VECTORS_FOR_PREMATCH, you can define a lower bound for the amount of data
-required for pre-matching. Utterances for which the matching pool is lower than this
-threshold are not pre-matched, and stored as-is.
+    0      convolutional projection layer
+    1-24   WavLM transformer layers
 
+If torchcodec or ffmpeg is not available, this version uses torchaudio instead.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
-import os
+import math
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -30,239 +34,528 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from torch import Tensor
-from torchcodec.decoders import AudioDecoder
+from torchaudio.pipelines import WAVLM_LARGE
 from tqdm import tqdm
 
-from wavlm import init_wavlm_large
-
+TARGET_SAMPLE_RATE = 16_000
 DOWNSAMPLE_FACTOR = 320
-MIN_VECTORS_FOR_PREMATCH = 9000  # 3 minutes
-MAX_VECTORS_FOR_PREMATCH = 24000  # 8 minutes
 
-# create logger
+MIN_VECTORS_FOR_PREMATCH = 9_000  # roughly 3 minutes
+MAX_VECTORS_FOR_PREMATCH = 24_000  # roughly 8 minutes
+MAX_WAVLM_LAYER = 24
+
 LOGGER = logging.getLogger("prematch_dataset")
-handler = logging.FileHandler("prematch_dataset.log")
-handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-LOGGER.addHandler(handler)
-LOGGER.setLevel(logging.INFO)
+
+
+def configure_logging() -> None:
+    """Configure file logging once."""
+
+    if LOGGER.handlers:
+        return
+
+    handler = logging.FileHandler("prematch_dataset.log")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    """One source utterance and its optional output path."""
+
+    source: Path
+    target: Path | None
+
+
+@dataclass(frozen=True)
+class FeatureExtractor:
+    """Thin WavLM wrapper for loading audio and returning selected layers."""
+
+    wavlm: nn.Module
+    device: torch.device
+    pad_to_multiple: bool
+
+    @torch.inference_mode()
+    def __call__(self, path: Path, layers: Iterable[int]) -> dict[int, Tensor]:
+        layer_set = set(layers)
+
+        for layer in layer_set:
+            validate_layer("layer", layer)
+
+        waveform = self.load_waveform(path)
+        selected: dict[int, Tensor] = {}
+
+        max_transformer_layer = max(
+            (layer for layer in layer_set if layer > 0), default=0
+        )
+
+        if max_transformer_layer:
+            transformer_features, _ = self.wavlm.extract_features(
+                waveform,
+                num_layers=max_transformer_layer,
+            )
+
+            for layer in layer_set:
+                if layer > 0:
+                    selected[layer] = transformer_features[layer - 1].squeeze(0)
+
+        if 0 in layer_set:
+            conv_features, _ = self.wavlm.feature_extractor(waveform, None)
+            projection = self.wavlm.encoder.feature_projection(conv_features)
+
+            if isinstance(projection, tuple):
+                projection = projection[0]
+
+            selected[0] = projection.squeeze(0)
+
+        return selected
+
+    def load_waveform(self, path: Path) -> Tensor:
+        waveform, sample_rate = torchaudio.load(path)
+
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        if sample_rate != TARGET_SAMPLE_RATE:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                sample_rate,
+                TARGET_SAMPLE_RATE,
+            )
+
+        if self.pad_to_multiple:
+            waveform = pad_waveform_to_downsample_factor(waveform)
+
+        return waveform.to(self.device)
+
+
+@dataclass(frozen=True)
+class PreMatcher:
+    """kNN pre-matcher for one speaker chunk."""
+
+    topk: int
+    distance_batch_size: int
+
+    @torch.inference_mode()
+    def __call__(
+        self,
+        match_feats: Sequence[Tensor],
+        synth_feats: Sequence[Tensor],
+        targets: Sequence[Path | None],
+    ) -> list[Tensor | None]:
+        if not match_feats:
+            return []
+
+        lengths = [int(feat.shape[0]) for feat in match_feats]
+        frame_ranges = make_frame_ranges(lengths)
+
+        match_raw = torch.cat(tuple(match_feats), dim=0)
+        match_all = F.normalize(match_raw.float(), p=2, dim=-1, eps=1e-12)
+
+        if match_feats is synth_feats:
+            synth_all = match_raw
+        else:
+            synth_all = torch.cat(tuple(synth_feats), dim=0)
+
+        matched: list[Tensor | None] = [None] * len(match_feats)
+
+        for utt_idx, (start, end) in enumerate(frame_ranges):
+            target_path = targets[utt_idx]
+
+            if target_path is None:
+                continue
+
+            source_match = match_all[start:end]
+            source_synth = synth_all[start:end]
+            target_count = match_all.shape[0] - source_match.shape[0]
+
+            if source_match.shape[0] == 0:
+                matched[utt_idx] = source_synth
+                continue
+
+            if target_count < MIN_VECTORS_FOR_PREMATCH:
+                LOGGER.warning("Not enough target vectors for %s", target_path)
+                matched[utt_idx] = source_synth
+                continue
+
+            target_match = without_range(match_all, start, end)
+            target_synth = without_range(synth_all, start, end)
+            k = min(self.topk, target_match.shape[0])
+
+            batches: list[Tensor] = []
+
+            for source_batch in batches_of_rows(source_match, self.distance_batch_size):
+                distances = 1.0 - source_batch @ target_match.T
+                nearest = distances.topk(k=k, dim=-1, largest=False).indices
+                batches.append(target_synth[nearest].mean(dim=1))
+
+            matched[utt_idx] = torch.cat(batches, dim=0)
+
+        return matched
 
 
 def make_df(root_path: Path, ext: str = ".flac") -> pd.DataFrame:
+    """Build a dataframe with file paths and speaker ids."""
 
-    LOGGER.info(f"Loading files from {root_path}")
-    files = list((root_path).rglob("**/*" + ext))
-    speakers = [f.stem.split("-")[0] for f in files]
-    df = pd.DataFrame({"path": files, "speaker": speakers})
-    LOGGER.info(f"Loaded {len(df)} files")
+    if not root_path.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {root_path}")
 
-    return df
+    normalized_ext = ext if ext.startswith(".") else f".{ext}"
+
+    LOGGER.info("Loading %s files from %s", normalized_ext, root_path)
+
+    files = sorted(root_path.rglob(f"*{normalized_ext}"))
+    speakers = [path.stem.split("-")[0] for path in files]
+
+    LOGGER.info("Loaded %s files", len(files))
+
+    return pd.DataFrame({"path": files, "speaker": speakers})
 
 
-def main(args):
-    LOGGER.info(f"Starting run with args {args}")
-    df = make_df(Path(args.path), ext=args.ext)
+def validate_layer(name: str, layer: int) -> None:
+    """Validate a user-facing WavLM layer index."""
 
-    LOGGER.info("Loading wavlm.")
-    wavlm = init_wavlm_large(pretrained=True, progress=True, device=args.device)
-    wavlm.extract_from_layer = args.layer
+    if not 0 <= layer <= MAX_WAVLM_LAYER:
+        raise ValueError(f"{name} must be between 0 and {MAX_WAVLM_LAYER}, got {layer}")
+
+
+def validate_positive(name: str, value: int) -> None:
+    """Validate a positive integer CLI argument."""
+
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {value}")
+
+
+def pad_waveform_to_downsample_factor(waveform: Tensor) -> Tensor:
+    """Pad the waveform only when it is not already divisible by the stride."""
+
+    n_pad = (-waveform.shape[-1]) % DOWNSAMPLE_FACTOR
+
+    if n_pad == 0:
+        return waveform
+
+    return F.pad(waveform, (0, n_pad), value=0.0)
+
+
+def save_tensor(path: Path, tensor: Tensor) -> None:
+    """Save a tensor as CPU float16, creating parent directories as needed."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tensor.detach().cpu().half(), path)
+
+
+def make_frame_ranges(lengths: Sequence[int]) -> list[tuple[int, int]]:
+    """Convert per-utterance frame counts into stacked tensor slice ranges."""
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+
+    for length in lengths:
+        end = start + int(length)
+        ranges.append((start, end))
+        start = end
+
+    return ranges
+
+
+def without_range(tensor: Tensor, start: int, end: int) -> Tensor:
+    """Return tensor rows outside [start, end)."""
+
+    if start == 0:
+        return tensor[end:]
+
+    if end == tensor.shape[0]:
+        return tensor[:start]
+
+    return torch.cat((tensor[:start], tensor[end:]), dim=0)
+
+
+def batches_of_rows(tensor: Tensor, batch_size: int) -> Iterable[Tensor]:
+    """Yield row batches from a 2D tensor."""
+
+    for start in range(0, tensor.shape[0], batch_size):
+        yield tensor[start : start + batch_size]
+
+
+def make_chunk_ranges(feat_lens: Sequence[int]) -> list[tuple[int, int]]:
+    """
+    Split a speaker into utterance-aligned chunks when there is a lot of data.
+
+    Chunks are balanced by total frame count, but never split an utterance.
+    """
+
+    n_utts = len(feat_lens)
+    total_feats = int(sum(feat_lens))
+
+    if n_utts == 0:
+        return []
+
+    if n_utts == 1 or total_feats <= MAX_VECTORS_FOR_PREMATCH * 2:
+        return [(0, n_utts)]
+
+    n_splits = min(n_utts, max(2, math.ceil(total_feats / MAX_VECTORS_FOR_PREMATCH)))
+    target_chunk_size = total_feats / n_splits
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    running_feats = 0
+
+    for end, feat_len in enumerate(feat_lens, start=1):
+        running_feats += int(feat_len)
+
+        remaining_utts = n_utts - end
+        remaining_splits = n_splits - len(ranges) - 1
+
+        if (
+            remaining_splits > 0
+            and running_feats >= target_chunk_size
+            and remaining_utts >= remaining_splits
+        ):
+            ranges.append((start, end))
+            start = end
+            running_feats = 0
+
+    if start < n_utts:
+        ranges.append((start, n_utts))
+
+    return ranges
+
+
+def speaker_items(
+    group: pd.DataFrame,
+    source_root: Path,
+    out_path: Path,
+    resume: bool,
+) -> list[WorkItem]:
+    """Build per-speaker work items, preserving resumed files as match candidates."""
+
+    items: list[WorkItem] = []
+
+    for row in group.itertuples(index=False):
+        source = Path(row.path)
+        rel_path = source.relative_to(source_root)
+        target = (out_path / rel_path).with_suffix(".pt")
+
+        if resume and target.is_file():
+            LOGGER.warning("Features already exist for %s", rel_path)
+            target = None
+
+        items.append(WorkItem(source=source, target=target))
+
+    return items
+
+
+def save_unmatched_speaker(
+    items: Sequence[WorkItem],
+    extractor: FeatureExtractor,
+    synthesis_layer: int,
+) -> None:
+    """Extract and save one synthesis layer without pre-matching."""
+
+    for item in items:
+        if item.target is None:
+            continue
+
+        features = extractor(item.source, {synthesis_layer})
+        save_tensor(item.target, features[synthesis_layer])
+
+
+def load_speaker_features(
+    items: Sequence[WorkItem],
+    extractor: FeatureExtractor,
+    matching_layer: int,
+    synthesis_layer: int,
+) -> tuple[list[Tensor], list[Tensor], list[Path | None]]:
+    """Load matching and synthesis features for one speaker."""
+
+    match_feats: list[Tensor] = []
+    synth_feats: list[Tensor] = []
+    targets: list[Path | None] = []
+
+    for item in items:
+        selected = extractor(item.source, {matching_layer, synthesis_layer})
+
+        match_tensor = selected[matching_layer].detach().cpu()
+
+        if matching_layer == synthesis_layer:
+            synth_tensor = match_tensor
+        else:
+            synth_tensor = selected[synthesis_layer].detach().cpu()
+
+        if match_tensor.shape[0] != synth_tensor.shape[0]:
+            raise ValueError(
+                "Matching and synthesis layers must have the same number of frames "
+                f"for {item.source}: {match_tensor.shape[0]} != {synth_tensor.shape[0]}"
+            )
+
+        match_feats.append(match_tensor)
+        synth_feats.append(synth_tensor)
+        targets.append(item.target)
+
+    return match_feats, synth_feats, targets
+
+
+def save_prematched_speaker(
+    items: Sequence[WorkItem],
+    extractor: FeatureExtractor,
+    prematcher: PreMatcher,
+    matching_layer: int,
+    synthesis_layer: int,
+) -> None:
+    """Extract, pre-match, and save all unfinished utterances for one speaker."""
+
+    match_cpu, synth_cpu, targets = load_speaker_features(
+        items=items,
+        extractor=extractor,
+        matching_layer=matching_layer,
+        synthesis_layer=synthesis_layer,
+    )
+
+    feat_lens = [int(feat.shape[0]) for feat in match_cpu]
+
+    for start, end in make_chunk_ranges(feat_lens):
+        chunk_match = [feat.to(extractor.device) for feat in match_cpu[start:end]]
+
+        if matching_layer == synthesis_layer:
+            chunk_synth = chunk_match
+        else:
+            chunk_synth = [feat.to(extractor.device) for feat in synth_cpu[start:end]]
+
+        chunk_targets = targets[start:end]
+        matched = prematcher(chunk_match, chunk_synth, chunk_targets)
+
+        for target, features in zip(chunk_targets, matched):
+            if target is not None and features is not None:
+                save_tensor(target, features)
+
+
+def extract(
+    df: pd.DataFrame,
+    extractor: FeatureExtractor,
+    source_root: Path,
+    out_path: Path,
+    synthesis_layer: int,
+    matching_layer: int,
+    prematch: bool,
+    resume: bool,
+    topk: int,
+    distance_batch_size: int,
+) -> None:
+    """Extract and optionally pre-match features for all speakers."""
+
+    prematcher = PreMatcher(topk=topk, distance_batch_size=distance_batch_size)
+    grouped = df.groupby("speaker", sort=True)
+
+    for speaker, group in tqdm(grouped, total=df["speaker"].nunique()):
+        LOGGER.info("Processing speaker %s with %s utterances", speaker, len(group))
+
+        items = speaker_items(
+            group=group,
+            source_root=source_root,
+            out_path=out_path,
+            resume=resume,
+        )
+
+        if all(item.target is None for item in items):
+            LOGGER.info("All outputs already exist for speaker %s", speaker)
+            continue
+
+        if prematch:
+            save_prematched_speaker(
+                items=items,
+                extractor=extractor,
+                prematcher=prematcher,
+                matching_layer=matching_layer,
+                synthesis_layer=synthesis_layer,
+            )
+        else:
+            save_unmatched_speaker(
+                items=items,
+                extractor=extractor,
+                synthesis_layer=synthesis_layer,
+            )
+
+
+def main(args: argparse.Namespace) -> None:
+    """Run the feature extraction job."""
+
+    configure_logging()
+
+    validate_layer("synthesis_layer", args.synthesis_layer)
+    validate_layer("matching_layer", args.matching_layer)
+    validate_positive("topk", args.topk)
+    validate_positive("distance_batch_size", args.distance_batch_size)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    source_root = Path(args.path)
+    out_path = Path(args.out_path)
+    device = torch.device(args.device)
+
+    LOGGER.info("Starting run with args %s", args)
+
+    df = make_df(source_root, ext=args.ext)
+
+    LOGGER.info("Loading WavLM large from torchaudio")
+    wavlm = WAVLM_LARGE.get_model().to(device)
+    wavlm.eval()
+
+    extractor = FeatureExtractor(
+        wavlm=wavlm,
+        device=device,
+        pad_to_multiple=not args.no_pad,
+    )
+
     extract(
-        df,
-        wavlm,
-        args.device,
-        args.prematch,
-        args.topk,
-        Path(args.path),
-        Path(args.out_path),
-        args.resume,
+        df=df,
+        extractor=extractor,
+        source_root=source_root,
+        out_path=out_path,
+        synthesis_layer=args.synthesis_layer,
+        matching_layer=args.matching_layer,
+        prematch=args.prematch,
+        resume=args.resume,
+        topk=args.topk,
+        distance_batch_size=args.distance_batch_size,
     )
+
     LOGGER.info("All done!")
-
-
-@torch.inference_mode()
-def get_features(path: Path, wavlm: nn.Module, device: str) -> Tensor:
-    """
-    Extracts WavLM features from the given audio path, and returns them as a single
-    tensor of shape (1, n_feats, feat_dim).
-    """
-
-    # load audio and ensure it's divisible by WavLM's featex
-    x = AudioDecoder(path, sample_rate=16_000).get_all_samples().data
-    n_pad = DOWNSAMPLE_FACTOR - (x.shape[-1] % DOWNSAMPLE_FACTOR)
-    x = F.pad(x, (0, n_pad), value=0)
-
-    # extract the representation of each layer
-    x = x.to(device)
-    if wavlm.extract_from_layer == 0:
-        c, lengths = wavlm.feature_extractor(x, None)
-        features = wavlm.encoder.feature_projection(c)
-    else:
-        features_list, _ = wavlm.extract_features(
-            x, num_layers=wavlm.extract_from_layer
-        )
-        features = features_list[-1]
-
-    return features
-
-
-def fast_cosine_dist(source_feats: Tensor, pool: Tensor) -> Tensor:
-    """
-    Receives two tensors of shape (n_feats_a, feat_dim), (n_feats_b, feat_dim) and
-    returns the distances between all pairs of their features (n_feats_a, n_feats_b).
-    """
-    source_norms = torch.norm(source_feats, p=2, dim=-1)
-    norms = torch.norm(pool, p=2, dim=-1)
-    dotprod = (
-        -torch.cdist(source_feats[None], pool[None], p=2)[0] ** 2
-        + source_norms[:, None] ** 2
-        + norms[None] ** 2
-    )
-    dotprod /= 2
-
-    dists = 1 - (dotprod / (source_norms[:, None] * norms[None]))
-    return dists
-
-
-@torch.inference_mode()
-def extract(
-    df: pd.DataFrame,
-    wavlm: nn.Module,
-    device: str,
-    prematch: bool,
-    topk: int,
-    ls_path: Path,
-    out_path: Path,
-    resume: bool,
-):
-
-    # iterate over all unique speakers
-    for _, group in tqdm(df.groupby("speaker"), total=df["speaker"].nunique()):
-        # extract features from all the speaker's utterances
-        feats = list()
-        dump_paths = list()
-        for _, row in group.iterrows():
-
-            rel_path = Path(row.path).relative_to(ls_path)
-            target_path = (out_path / rel_path).with_suffix(".pt")
-            if resume and target_path.is_file():
-                LOGGER.warning(f"Features already exist for {rel_path}")
-                target_path = None
-
-            os.makedirs(target_path.parent, exist_ok=True)
-            feats.append(get_features(row.path, wavlm, device))
-            dump_paths.append(target_path)
-
-        if prematch:
-            # split data if there is enough for at least 2 disjoint parts
-            feat_lens = torch.tensor([f.shape[0] for f in feats])
-            sum_feats = torch.sum(feat_lens)
-            if sum_feats > MAX_VECTORS_FOR_PREMATCH * 2:
-
-                # find where to split
-                n_splits = sum_feats // MAX_VECTORS_FOR_PREMATCH
-                chunk_size = sum_feats // n_splits
-                cumsum_feats = torch.cumsum(feat_lens, dim=0)
-
-                # prematch each chunk
-                feats_prematched = list()
-                start_idx = 0
-                for split_number in range(n_splits):
-                    if split_number == n_splits - 1:
-                        split_idx = len(feats)
-                    else:
-                        split_max = chunk_size * (split_number + 1)
-                        split_idx = torch.argwhere(cumsum_feats > split_max)[0]
-
-                    chunk = feats[start_idx:split_idx]
-                    feats_prematched.extend(
-                        prematch_feats(chunk, topk, dump_paths, resume)
-                    )
-                    start_idx = split_idx
-
-                feats = feats_prematched
-
-            else:
-                feats = prematch_feats(feats, topk, dump_paths, resume)
-
-        # dump the features and continue
-        for dump_path, dump_feats in zip(dump_paths, feats):
-            torch.save(dump_feats.cpu().half(), dump_path)
-
-
-def prematch_feats(
-    feats: list[Tensor], topk: int, dump_paths: list[str], resume: bool
-) -> list[Tensor]:
-    """
-    Given the WavLM features of several utterances of the same speaker, pre-match
-    them by doing a kNN regression where the utterance being regressed is removed
-    from the pool.
-    """
-
-    # vectorize feats and keep track of the utterances
-    device = feats[0].device
-    n_utts = len(feats)
-
-    # Pre-calculate offsets to avoid repeated masking
-    offsets = torch.cumsum(torch.tensor([0] + [f.shape[0] for f in feats]), dim=0)
-
-    utts = torch.hstack(
-        [
-            torch.ones(feats[idx].shape[0], dtype=torch.int) * idx
-            for idx in range(len(feats))
-        ]
-    )
-    feats = torch.vstack(feats)
-
-    # compute cosine distances between all features
-    dists = torch.zeros((feats.shape[0], feats.shape[0]), device=device)
-    for idx_a in range(n_utts):
-        start_a, end_a = offsets[idx_a], offsets[idx_a + 1]
-        for idx_b in range(idx_a + 1, n_utts):
-            start_b, end_b = offsets[idx_b], offsets[idx_b + 1]
-            utt_dists = fast_cosine_dist(feats[start_a:end_a], feats[start_b:end_b])
-            dists[start_a:end_a, start_b:end_b] = utt_dists
-            dists[start_b:end_b, start_a:end_a] = utt_dists.T
-
-    # do the pre-matching
-    matched_feats = list()
-    for utt_idx in torch.arange(n_utts):
-
-        if resume and dump_paths[utt_idx] is None:
-            continue
-
-        utt_mask = utts == utt_idx
-        target_feats = feats[~utt_mask]
-
-        if target_feats.shape[0] < MIN_VECTORS_FOR_PREMATCH:
-            LOGGER.warning(f"Not enough target vectors for {dump_paths[utt_idx]}")
-            matched_feats.append(feats[utt_mask])
-        else:
-            utt_dists = dists[utt_mask][:, ~utt_mask]
-            best = utt_dists.topk(k=topk, dim=-1, largest=False)
-            matched_feats.append(target_feats[best.indices].mean(dim=1))
-
-    return matched_feats
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compute matched wavlm features for a dataset"
+        description="Compute optionally pre-matched WavLM features for a dataset"
     )
 
     parser.add_argument("path", type=str)
     parser.add_argument("out_path", type=str)
+
     parser.add_argument("--seed", default=123, type=int)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--ext", default=".flac", type=str)
+
     parser.add_argument("--topk", type=int, default=4)
-    parser.add_argument("--layer", type=int, default=6)
+    parser.add_argument("--synthesis_layer", type=int, default=6)
+    parser.add_argument("--matching_layer", type=int, default=6)
+
     parser.add_argument("--prematch", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--no_pad",
+        action="store_true",
+        help="Do not zero-pad waveforms to a multiple of the WavLM downsample factor",
+    )
+    parser.add_argument(
+        "--distance_batch_size",
+        type=int,
+        default=1024,
+        help="Number of source frames to match at once during pre-matching",
+    )
 
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())
