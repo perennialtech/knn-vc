@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
 from torch import Tensor
-from torchaudio.models import Wav2Vec2Model
 
 from .devices import module_device, resolve_device
 from .hifigan.models import Generator as HiFiGAN
@@ -96,7 +95,7 @@ class KNeighborsVC(nn.Module):
 
     def __init__(
         self,
-        wavlm: Wav2Vec2Model,
+        wavlm: nn.Module,
         hifigan: HiFiGAN,
         hifigan_cfg: AttrDict,
         device: str | torch.device | None = None,

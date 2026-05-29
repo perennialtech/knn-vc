@@ -46,13 +46,14 @@ def extract_wavlm_layers(
     if not layer_ids:
         return {}
 
-    transformer_features, _ = wavlm.extract_features(
+    ((_, layer_results), _) = wavlm.extract_features(
         waveform,
-        num_layers=max(layer_ids),
+        output_layer=max(layer_ids),
+        ret_layer_results=True,
     )
 
     selected: dict[int, Tensor] = {}
     for layer in layer_ids:
-        selected[layer] = transformer_features[layer - 1].squeeze(0)
+        selected[layer] = layer_results[layer][0].transpose(0, 1).squeeze(0)
 
     return selected

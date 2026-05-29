@@ -155,7 +155,7 @@ def load_wavlm_large(
     progress: bool = True,
     device: str | torch.device | None = None,
 ) -> torch.nn.Module:
-    """Load WavLM large from torchaudio."""
+    """Load WavLM large using the native implementation."""
 
     resolved_device = resolve_device(device)
     return init_wavlm_large(

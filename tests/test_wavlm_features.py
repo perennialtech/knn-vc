@@ -8,14 +8,16 @@ class _FakeWavLM:
     def __init__(self):
         self.num_layers = 0
 
-    def extract_features(self, waveform, num_layers):
-        self.num_layers = num_layers
+    def extract_features(self, waveform, output_layer=None, ret_layer_results=False):
+        self.num_layers = output_layer
         batch_size, n_frames = waveform.shape
-        features = [
-            torch.full((batch_size, n_frames, 2), float(layer + 1))
-            for layer in range(num_layers)
-        ]
-        return features, None
+
+        layer_results = []
+        for layer in range(output_layer + 1):
+            feat = torch.full((n_frames, batch_size, 2), float(layer))
+            layer_results.append((feat, None))
+
+        return ((None, layer_results), None)
 
 
 def test_extract_wavlm_layers_selects_one_based_transformer_layers():

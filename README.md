@@ -109,9 +109,9 @@ The target speaker from `ref_wav_paths` can be any speaker, but the reference au
 
 ## Checkpoints
 
-The original kNN-VC release provides three checkpoints (the WavLM checkpoint is now natively downloaded via `torchaudio.pipelines`):
+The original kNN-VC release provides three checkpoints:
 
-- The WavLM encoder is loaded natively via `torchaudio.pipelines.WAVLM_LARGE`.
+- The WavLM encoder is loaded natively via the original unilm checkpoint.
 - The HiFi-GAN vocoder trained on layer 6 of WavLM features.
 - The HiFi-GAN vocoder trained on prematched layer 6 of WavLM features, which is the best model in the paper.
 

@@ -1,10 +1,10 @@
 import logging
 
 import torch
-from torchaudio.pipelines import WAVLM_LARGE
 
 from ..devices import resolve_device
 from .features import SPEAKER_INFORMATION_LAYER
+from .WavLM import WavLM, WavLMConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -12,18 +12,28 @@ LOGGER = logging.getLogger(__name__)
 def init_wavlm_large(
     pretrained: bool = True, progress: bool = True, device: str | torch.device = "cuda"
 ) -> torch.nn.Module:
-    """Load the WavLM large checkpoint from torchaudio pipelines.
-    This replaces the legacy unilm/fairseq implementation.
-    """
+    """Load the WavLM large checkpoint using the original unilm implementation."""
     if not pretrained:
         raise ValueError(
-            "pretrained=False is not supported for WavLM large because torchaudio "
-            "does not expose an uninitialized WAVLM_LARGE constructor."
+            "pretrained=False is not supported for WavLM large because we read "
+            "the large configuration dict locally from the checkpoint."
         )
 
     device = resolve_device(device)
 
-    model = WAVLM_LARGE.get_model(dl_kwargs={"progress": progress})
+    checkpoint = torch.hub.load_state_dict_from_url(
+        "https://github.com/bshall/knn-vc/releases/download/v0.1/WavLM-Large.pt",
+        map_location="cpu",
+        progress=progress,
+    )
+
+    cfg_dict = checkpoint["cfg"]
+    if not isinstance(cfg_dict, dict):
+        cfg_dict = vars(cfg_dict)
+
+    cfg = WavLMConfig(cfg_dict)
+    model = WavLM(cfg)
+    model.load_state_dict(checkpoint["model"])
 
     setattr(model, "extract_from_layer", SPEAKER_INFORMATION_LAYER)
 

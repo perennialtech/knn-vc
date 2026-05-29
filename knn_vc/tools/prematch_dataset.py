@@ -35,11 +35,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from torch import Tensor
-from torchaudio.pipelines import WAVLM_LARGE
 from tqdm import tqdm
 
 from knn_vc.devices import resolve_device
-from knn_vc.wavlm import extract_wavlm_layers, validate_wavlm_layer
+from knn_vc.wavlm import extract_wavlm_layers, init_wavlm_large, validate_wavlm_layer
 
 TARGET_SAMPLE_RATE = 16_000
 DOWNSAMPLE_FACTOR = 320
@@ -472,9 +471,8 @@ def main(args: argparse.Namespace) -> None:
 
     df = make_df(source_root, ext=args.ext)
 
-    LOGGER.info("Loading WavLM large from torchaudio")
-    wavlm = WAVLM_LARGE.get_model().to(device)
-    wavlm.eval()
+    LOGGER.info("Loading WavLM large")
+    wavlm = init_wavlm_large(device=device)
 
     extractor = FeatureExtractor(
         wavlm=wavlm,
