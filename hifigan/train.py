@@ -1,335 +1,400 @@
 import argparse
 import itertools
-import json
 import os
 import time
+import logging
+import subprocess
 
 import torch
-import torch.multiprocessing as mp
+from torch import Tensor
 import torch.nn.functional as F
-from fastprogress import master_bar, progress_bar
-from torch.cuda.amp.grad_scaler import GradScaler
-from torch.distributed import init_process_group
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from .meldataset import (LogMelSpectrogram, MelDataset, get_dataset_filelist,
-                         mel_spectrogram)
-from .models import (Generator, MultiPeriodDiscriminator,
-                     MultiScaleDiscriminator, discriminator_loss, feature_loss,
-                     generator_loss)
-from .utils import (AttrDict, build_env, load_checkpoint, plot_spectrogram,
-                    save_checkpoint, scan_checkpoint)
+from tqdm import tqdm
+from omegaconf import DictConfig, OmegaConf
+
+
+from .mel_utils import LogMelSpectrogram
+from .models import (
+    Generator,
+    MultiPeriodDiscriminator,
+    MultiScaleDiscriminator,
+    discriminator_loss,
+    feature_loss,
+    generator_loss,
+)
+from .utils import AttrDict, load_checkpoint, scan_checkpoint
+from .datamodules import create_dataloader
 
 torch.backends.cudnn.benchmark = True
-USE_ALT_MELCALC = True
 
 
-def train(rank, a, h):
-    if h.num_gpus > 1:
-        init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
-                           world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
+class Trainer:
+    def __init__(self, config: AttrDict, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.tb_logger = SummaryWriter(config.ckpt_path)
+        self.device = config.device
 
-    torch.cuda.manual_seed(h.seed)
-    device = torch.device('cuda:{:d}'.format(rank))
+        # init models
+        self.generator = Generator(config.hifigan).to(self.device)
+        self.mpd = MultiPeriodDiscriminator().to(self.device)
+        self.msd = MultiScaleDiscriminator().to(self.device)
 
-    generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
+        # check if ckpt folder already exists and retrieve checkpoints
+        os.makedirs(config.ckpt_path, exist_ok=True)
+        logger.info("checkpoints directory : ", config.ckpt_path)
+        if os.path.isdir(config.ckpt_path):
+            cp_g = scan_checkpoint(config.ckpt_path, "g_")
+            cp_do = scan_checkpoint(config.ckpt_path, "do_")
 
-    if rank == 0:
-        print(generator)
-        os.makedirs(a.checkpoint_path, exist_ok=True)
-        print("checkpoints directory : ", a.checkpoint_path)
+        # if ckpt folder is new, start training from scratch
+        if cp_g is None or cp_do is None:
+            self.steps = 0
+            state_dict_do = None
+            self.last_epoch = -1
 
-    if os.path.isdir(a.checkpoint_path):
-        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
-        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+        # otherwise, resume training from ckpt
+        else:
+            state_dict_g = load_checkpoint(cp_g, self.device)
+            state_dict_do = load_checkpoint(cp_do, self.device)
+            self.generator.load_state_dict(state_dict_g["generator"])
+            self.mpd.load_state_dict(state_dict_do["mpd"])
+            self.msd.load_state_dict(state_dict_do["msd"])
+            self.steps = state_dict_do["steps"] + 1
+            self.last_epoch = state_dict_do["epoch"]
+            logger.info(f"Restored checkpoint from {cp_g} and {cp_do}")
 
-    steps = 0
-    if cp_g is None or cp_do is None:
-        state_dict_do = None
-        last_epoch = -1
-    else:
-        state_dict_g = load_checkpoint(cp_g, device)
-        state_dict_do = load_checkpoint(cp_do, device)
-        generator.load_state_dict(state_dict_g['generator'])
-        mpd.load_state_dict(state_dict_do['mpd'])
-        msd.load_state_dict(state_dict_do['msd'])
-        steps = state_dict_do['steps'] + 1
-        last_epoch = state_dict_do['epoch']
-        print(f"Restored checkpoint from {cp_g} and {cp_do}")
+        # setup optimizers
+        self.optim_g = torch.optim.AdamW(
+            self.generator.parameters(),
+            config.adamw.learning_rate,
+            betas=[config.adamw.adam_b1, config.adamw.adam_b2],
+        )
+        self.optim_d = torch.optim.AdamW(
+            itertools.chain(self.msd.parameters(), self.mpd.parameters()),
+            config.adamw.learning_rate,
+            betas=[config.adamw.adam_b1, config.adamw.adam_b2],
+        )
 
-    if h.num_gpus > 1:
-        print("Multi-gpu detected")
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+        # load optimizer checkpoints if appropriate
+        if state_dict_do is not None:
+            self.optim_g.load_state_dict(state_dict_do["optim_g"])
+            self.optim_d.load_state_dict(state_dict_do["optim_d"])
 
-    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
-    optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
-                                h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+        # setup schedulers and gradient scalers
+        self.scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+            self.optim_g, gamma=config.adamw.lr_decay, last_epoch=self.last_epoch
+        )
+        self.scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+            self.optim_d, gamma=config.adamw.lr_decay, last_epoch=self.last_epoch
+        )
+        self.scaler_g = GradScaler(self.device, enabled=config.fp16)
+        self.scaler_d = GradScaler(self.device, enabled=config.fp16)
 
-    if state_dict_do is not None:
-        optim_g.load_state_dict(state_dict_do['optim_g'])
-        optim_d.load_state_dict(state_dict_do['optim_d'])
+        # create dataloaders
+        self.train_loader = create_dataloader(config.train_tars, config, logger)
+        self.valid_loader = create_dataloader(
+            config.valid_tars, config, logger, shuffle=False
+        )
 
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
-    if a.fp16:
-        scaler_g = GradScaler()
-        scaler_d = GradScaler()
+        # initialize mel-spectrogram transform
+        self.melspec = LogMelSpectrogram(
+            config.mel.n_fft,
+            config.mel.num_mels,
+            config.sample_rate,
+            config.hifigan.hop_size,
+            config.mel.win_size,
+            config.mel.fmin,
+            config.mel.fmax,
+        ).to(self.device)
 
-    train_df, valid_df = get_dataset_filelist(a)
+        # start training
+        self.train()
 
-    trainset = MelDataset(train_df, h.segment_size, h.n_fft, h.num_mels,
-                          h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
-                          shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning,
-                          audio_root_path=a.audio_root_path, feat_root_path=a.feature_root_path, 
-                          use_alt_melcalc=USE_ALT_MELCALC)
+    def train(self):
+        self.generator.train()
+        self.mpd.train()
+        self.msd.train()
 
-    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+        for epoch in tqdm(range(max(0, self.last_epoch), self.config.training_epochs)):
+            start_epoch = time.time()
 
-    train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=False,
-                              sampler=train_sampler,
-                              batch_size=h.batch_size,
-                              pin_memory=True,
-                              persistent_workers=True,
-                              drop_last=True)
+            for batch in self.train_loader:
+                start_batch = time.time()
+                y_mel, y_g_hat_mel, loss_gen_all, loss_disc_all = self.train_batch(
+                    batch
+                )
 
-    alt_melspec = LogMelSpectrogram(h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax).to(device)
+                # logging and checkpointing
+                if self.steps % self.config.checkpoint_interval == 0 and self.steps > 0:
+                    self.store_checkpoint(epoch)
 
-    if rank == 0:
-        validset = MelDataset(valid_df, h.segment_size, h.n_fft, h.num_mels,
-                              h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
-                              fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              audio_root_path=a.audio_root_path, feat_root_path=a.feature_root_path, 
-                              use_alt_melcalc=USE_ALT_MELCALC)
-        validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
-                                       sampler=None,
-                                       batch_size=1,
-                                       pin_memory=True,
-                                       persistent_workers=True,
-                                       drop_last=True)
+                if self.steps % self.config.log_interval == 0:
+                    self.write_training_logs(
+                        loss_gen_all, y_mel, y_g_hat_mel, loss_disc_all, start_batch
+                    )
 
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
-
-    generator.train()
-    mpd.train()
-    msd.train()
-    
-    if rank == 0: mb = master_bar(range(max(0, last_epoch), a.training_epochs))
-    else: mb = range(max(0, last_epoch), a.training_epochs)
-
-    for epoch in mb:
-        if rank == 0:
-            start = time.time()
-            mb.write("Epoch: {}".format(epoch+1))
-
-        if h.num_gpus > 1:
-            train_sampler.set_epoch(epoch)
-
-        if rank == 0: pb = progress_bar(enumerate(train_loader), total=len(train_loader), parent=mb)
-        else: pb = enumerate(train_loader)
-        
-
-        for i, batch in pb:
-            if rank == 0:
-                start_b = time.time()
-            x, y, _, y_mel = batch
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            y_mel = y_mel.to(device, non_blocking=True)
-            y = y.unsqueeze(1)
-            
-            with torch.cuda.amp.autocast(enabled=a.fp16):
-                y_g_hat = generator(x)
-                if USE_ALT_MELCALC:
-                    y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                else:
-                    y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                            h.fmin, h.fmax_for_loss)
-            # print(x.shape, y_g_hat.shape, y_g_hat_mel.shape, y_mel.shape, y.shape)
-            optim_d.zero_grad()
-
-            with torch.cuda.amp.autocast(enabled=a.fp16):
-                # MPD
-                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-                loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
-
-                # MSD
-                y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-                loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-
-                loss_disc_all = loss_disc_s + loss_disc_f
-
-            if a.fp16: 
-                scaler_d.scale(loss_disc_all).backward()
-                scaler_d.step(optim_d)
-                scaler_d.update()
-            else: 
-                loss_disc_all.backward()
-                optim_d.step()
-
-            # Generator
-            optim_g.zero_grad()
-
-            with torch.cuda.amp.autocast(enabled=a.fp16):
-                # L1 Mel-Spectrogram Loss
-                loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
-
-                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-                y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-                loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-                loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-                loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-                loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-                loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
-
-            if a.fp16:
-                scaler_g.scale(loss_gen_all).backward()
-                scaler_g.step(optim_g)
-                scaler_g.update()
-            else:
-                loss_gen_all.backward()
-                optim_g.step()
-
-            if rank == 0:
-                # STDOUT logging
-                if steps % a.stdout_interval == 0:
-                    with torch.no_grad():
-                        mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
-
-                    mb.write('Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, sec/batch : {:4.3f}, peak mem: {:5.2f}GB'. \
-                            format(steps, loss_gen_all, mel_error, time.time() - start_b, torch.cuda.max_memory_allocated()/1e9))
-                    mb.child.comment = "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}". \
-                            format(steps, loss_gen_all, mel_error)
-                    
-
-                # checkpointing
-                if steps % a.checkpoint_interval == 0 and steps != 0:
-                    checkpoint_path = "{}/g_{:08d}.pt".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path,
-                                    {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
-                    checkpoint_path = "{}/do_{:08d}.pt".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
-                                    {'mpd': (mpd.module if h.num_gpus > 1
-                                                         else mpd).state_dict(),
-                                     'msd': (msd.module if h.num_gpus > 1
-                                                         else msd).state_dict(),
-                                     'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
-                                     'epoch': epoch})
-
-                # Tensorboard summary logging
-                if steps % a.summary_interval == 0:
-                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
-                    sw.add_scalar("training/mel_spec_error", mel_error, steps)
-                    sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
-
-                # Validation
-                if steps % a.validation_interval == 0:  # and steps != 0:
-                    generator.eval()
+                # validation
+                if self.steps % self.config.validation_interval == 0:
+                    self.generator.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
+                    n_batches = 0
                     with torch.no_grad():
-                        for j, batch in progress_bar(enumerate(validation_loader), total=len(validation_loader), parent=mb):
-                            x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
-                            y_mel = y_mel.to(device, non_blocking=True)
-                            if USE_ALT_MELCALC:
-                                y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                                if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
-                                    # pad it 
-                                    n_pad = h.hop_size 
-                                    y_g_hat = F.pad(y_g_hat, (n_pad//2, n_pad - n_pad//2))
-                                    y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
-                            else:
-                                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                                            h.hop_size, h.win_size,
-                                                            h.fmin, h.fmax_for_loss)
-                            #print('valid', x.shape, y_g_hat.shape, y_g_hat_mel.shape, y_mel.shape, y.shape)
-                            val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+                        for batch in self.valid_loader:
+                            val_err = self.valid_batch(batch)
+                            val_err_tot += val_err
+                            n_batches += 1
 
-                            if j <= 4:
-                                if steps == 0:
-                                    sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
-                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
+                    # log avg. mel-spech error on the validation set
+                    val_err = val_err_tot / n_batches
+                    self.tb_logger.add_scalar(
+                        "val/mel_spec_error", val_err, self.steps
+                    )
+                    self.logger.info(
+                        f"val. done at {self.steps:,d} steps. mel spec error: {val_err:5.4f}"
+                    )
 
-                                sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
-                                if USE_ALT_MELCALC:
-                                    y_hat_spec = alt_melspec(y_g_hat.squeeze(1))
-                                else:
-                                    y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                                                h.hop_size, h.win_size,
-                                                                h.fmin, h.fmax_for_loss)
+                    # go back to training
+                    self.generator.train()
+                    self.tb_logger.add_scalar(
+                        "memory/max_allocated_gb",
+                        torch.cuda.max_memory_allocated() / 1e9,
+                        self.steps,
+                    )
+                    self.tb_logger.add_scalar(
+                        "memory/max_reserved_gb",
+                        torch.cuda.max_memory_reserved() / 1e9,
+                        self.steps,
+                    )
+                    if self.device == "cuda":
+                        torch.cuda.reset_peak_memory_stats()
+                        torch.cuda.reset_accumulated_memory_stats()
 
-                                sw.add_figure('generated/y_hat_spec_{}'.format(j),
-                                              plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+                self.steps += 1
 
-                        val_err = val_err_tot / (j+1)
-                        sw.add_scalar("validation/mel_spec_error", val_err, steps)
-                        mb.write(f"validation run complete at {steps:,d} steps. validation mel spec error: {val_err:5.4f}")
+            # epoch is done; update schedulers and log epoch duration
+            self.scheduler_g.step()
+            self.scheduler_d.step()
+            self.logger.info(
+                "Time taken for epoch {} is {} sec".format(
+                    epoch + 1, int(time.time() - start_epoch)
+                )
+            )
 
-                    generator.train()
-                    sw.add_scalar("memory/max_allocated_gb", torch.cuda.max_memory_allocated()/1e9, steps)
-                    sw.add_scalar("memory/max_reserved_gb", torch.cuda.max_memory_reserved()/1e9, steps)
-                    torch.cuda.reset_peak_memory_stats()
-                    torch.cuda.reset_accumulated_memory_stats()
+    def run_generator(self, batch) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        x = batch.ssl.to(self.device, non_blocking=True)
+        y = batch.audio.to(self.device, non_blocking=True)
+        y_mel = self.melspec(y.squeeze(1))
 
-            steps += 1
+        with torch.amp.autocast(enabled=self.config.fp16, device_type=self.device):
+            y_g_hat = self.generator(x)
+            y_g_hat_mel = self.melspec(y_g_hat.squeeze(1))
 
-        scheduler_g.step()
-        scheduler_d.step()
-        
-        if rank == 0:
-            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+        return y, y_mel, y_g_hat, y_g_hat_mel
+
+    def train_batch(self, batch) -> tuple[Tensor, Tensor]:
+        y, y_mel, y_g_hat, y_g_hat_mel = self.run_generator(batch)
+
+        # run discriminator and compute its losses
+        self.optim_d.zero_grad()
+        with torch.amp.autocast(enabled=self.config.fp16, device_type=self.device):
+            # MPD
+            y_df_hat_r, y_df_hat_g, _, _ = self.mpd(y, y_g_hat.detach())
+            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(
+                y_df_hat_r, y_df_hat_g
+            )
+
+            # MSD
+            y_ds_hat_r, y_ds_hat_g, _, _ = self.msd(y, y_g_hat.detach())
+            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(
+                y_ds_hat_r, y_ds_hat_g
+            )
+
+            loss_disc_all = loss_disc_s + loss_disc_f
+
+        # run the backward prop for the discriminators
+        self.scaler_d.scale(loss_disc_all).backward()
+        self.scaler_d.step(self.optim_d)
+        self.scaler_d.update()
+
+        # Compute generator losses
+        self.optim_g.zero_grad()
+        with torch.amp.autocast(enabled=self.config.fp16, device_type=self.device):
+            # L1 Mel-Spectrogram Loss
+            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+
+            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(y, y_g_hat)
+            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(y, y_g_hat)
+            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+
+        # run the backward prop for the generator
+        self.scaler_g.scale(loss_gen_all).backward()
+        self.scaler_g.step(self.optim_g)
+        self.scaler_g.update()
+
+        return y_mel, y_g_hat_mel, loss_gen_all, loss_disc_all
+
+    def valid_batch(self, batch) -> float:
+        y, y_mel, y_g_hat, y_g_hat_mel = self.run_generator(batch)
+
+        # pad the audio and compute the mel-spec again if shapes don't match
+        # TODO: this shouldn't be needed
+        if y_g_hat_mel.shape[-1] != y_mel.shape[-1]:
+            self.logger.warning("Mismatching shapes between mel-spectrograms!")
+            n_pad = self.config.hop_size
+            y_g_hat = F.pad(y_g_hat, (n_pad // 2, n_pad - n_pad // 2))
+            y_g_hat_mel = self.melspec(y_g_hat.squeeze(1))
+
+        return F.l1_loss(y_mel, y_g_hat_mel).item()
+
+    def write_training_logs(
+        self,
+        loss_gen_all: Tensor,
+        y_mel: Tensor,
+        y_g_hat_mel: Tensor,
+        loss_disc_all: Tensor,
+        start_batch: float,
+    ):
+        with torch.no_grad():
+            mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
+
+        # TB logs
+        self.tb_logger.add_scalar("train/gen_loss_total", loss_gen_all, self.steps)
+        self.tb_logger.add_scalar("train/mel_spec_error", mel_error, self.steps)
+        self.tb_logger.add_scalar("train/disc_loss_total", loss_disc_all, self.steps)
+
+        # TXT logs
+        self.logger.info(
+            "Steps : {:,d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, sec/batch : {:4.3f}, peak mem: {:5.2f}GB".format(
+                self.steps,
+                loss_gen_all,
+                mel_error,
+                time.time() - start_batch,
+                torch.cuda.max_memory_allocated() / 1e9,
+            )
+        )
+
+    def store_checkpoint(self, epoch: int):
+        self.logger.info(f"Storing checkpoints after {self.steps} steps")
+        ckpt_path = "{}/g_{:08d}.pt".format(self.config.ckpt_path, self.steps)
+        torch.save({"generator": (self.generator).state_dict()}, ckpt_path)
+        ckpt_path = "{}/do_{:08d}.pt".format(self.config.ckpt_path, self.steps)
+        torch.save(
+            {
+                "mpd": (self.mpd).state_dict(),
+                "msd": (self.msd).state_dict(),
+                "optim_g": self.optim_g.state_dict(),
+                "optim_d": self.optim_d.state_dict(),
+                "steps": self.steps,
+                "epoch": epoch,
+            },
+            ckpt_path,
+        )
+
+
+def override_with_args(config: DictConfig, args: dict):
+    """
+    Update the config with the passed arguments. The new value is casted to the type of
+    the existing value. If that fails, an error is raised.
+    """
+
+    def check_key_existence(config: DictConfig, key: str, full_key: str):
+        """Raise an error if the key does not exist in the cofig."""
+        if key not in config:
+            raise KeyError(
+                f"Subkey '{key}' not found in config for override '{full_key}'"
+            )
+
+    if len(args) % 2 != 0:
+        raise RuntimeError(
+            "The number of config arguments must be even (key-value pairs)"
+        )
+
+    # cast args to a dict
+    args_dict = dict()
+    for key_idx in range(0, len(args), 2):
+        args_dict[args[key_idx]] = args[key_idx + 1]
+
+    for key, value in args_dict.items():
+        keys = key.split(".")
+
+        # iterate over the keys that serve as directories
+        sub_config = config
+        for sub_key in keys[:-1]:
+            check_key_existence(sub_config, sub_key, key)
+            sub_config = sub_config[sub_key]
+
+        # change the value of the last key
+        last_key = keys[-1]
+        check_key_existence(sub_config, last_key, key)
+        if type(sub_config[last_key]) is not type(value):
+            old_type = type(sub_config[last_key])
+            try:
+                value = old_type(value)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to cast override for '{key}' to {old_type}: {e}"
+                )
+        sub_config[last_key] = value
 
 
 def main():
-    print('Initializing Training Process..')
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("config")
 
-    parser.add_argument('--group_name', default=None)
-    parser.add_argument('--audio_root_path', required=True)
-    parser.add_argument('--feature_root_path', required=True)
-    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
-    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
-    parser.add_argument('--checkpoint_path', default='cp_hifigan')
-    parser.add_argument('--config', default='')
-    parser.add_argument('--training_epochs', default=1500, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
-    parser.add_argument('--checkpoint_interval', default=5000, type=int)
-    parser.add_argument('--summary_interval', default=25, type=int)
-    parser.add_argument('--validation_interval', default=1000, type=int)
-    parser.add_argument('--fp16', default=False, type=bool)
-    parser.add_argument('--fine_tuning', action='store_true')
+    # load args and config overrides
+    args, config_overrides = parser.parse_known_args()
+    config = OmegaConf.load(args.config)
+    override_with_args(config, config_overrides)
 
-    a = parser.parse_args()
-    print(a)
-    with open(a.config) as f:
-        data = f.read()
+    # define logging directory
+    config.ckpt_path = os.path.join(config.checkpoint_dir, str(int(time.time())))
+    os.makedirs(config.ckpt_path)
 
-    json_config = json.loads(data)
-    h = AttrDict(json_config)
-    build_env(a.config, 'config.json', a.checkpoint_path)
+    # add args to config
+    for key, value in vars(args).items():
+        config[key] = value
 
-    torch.manual_seed(h.seed)
+    # dump config with commit hash
+    config.commit_hash = (
+        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
+        .decode("ascii")
+        .strip()
+    )
+    OmegaConf.save(config, os.path.join(config.ckpt_path, "config.yaml"))
+
+    # create logger
+    logger = logging.getLogger("train")
+    handler = logging.FileHandler(os.path.join(config.ckpt_path, "train.log"))
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.info("Initializing training")
+
+    torch.manual_seed(config.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
-        print('Batch size per GPU :', h.batch_size)
+        torch.cuda.manual_seed(config.seed)
+        logger.info("Batch size:", config.batch_size)
+        config.device = "cuda"
     else:
-        pass
+        logger.info("Batch size set to 1 for CPU")
+        config.batch_size = 1
+        config.device = "cpu"
 
-    if h.num_gpus > 1:
-        mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))
-    else:
-        train(0, a, h)
+    Trainer(config, logger)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
