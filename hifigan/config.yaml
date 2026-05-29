@@ -36,7 +36,6 @@ n_shuffle: 1000
 train_tars: ls-train-clean-100_prematch
 valid_tars: ls-dev-clean_prematch
 
-
 # train config
 seed: 0
 checkpoint_dir: logs
