@@ -25,9 +25,32 @@ Authors:
 
 \*Equal contribution
 
+## Setup
+
+This repository uses `uv` for local workflows. Install `uv` from the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/), then sync the environment from `pyproject.toml` and `uv.lock`:
+
+```bash
+uv sync
+```
+
+Run repository commands through `uv run`:
+
+```bash
+uv run python -m hifigan.train hifigan/config.yaml
+```
+
+For development hooks:
+
+```bash
+uv sync --group dev
+uv run pre-commit install
+```
+
+The project metadata, Python requirement, runtime dependencies, and development dependency group are maintained in `pyproject.toml`.
+
 ## Quickstart
 
-We use `torch.hub` to make loading the original kNN-VC model easy, with no repo clone required. The inference dependencies are `torch`, `torchaudio`, and `numpy`. Python must be version 3.10 or greater, and torch must be version 2.0 or greater.
+The original `torch.hub` inference quickstart remains available without cloning this repository.
 
 Load the WavLM encoder and HiFi-GAN vocoder:
 
@@ -94,13 +117,7 @@ This fork focuses especially on making vocoder training more convenient and fast
 
 ### HiFi-GAN training
 
-Install the training dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-The original HiFi-GAN training dependencies include `librosa`, `tensorboard`, `matplotlib`, `fastprogress`, and `scipy`. This fork also supports WebDataset-based training.
+Run the training utilities from the synced `uv` environment.
 
 #### 1. Precompute WavLM features
 
@@ -111,7 +128,7 @@ The original kNN-VC procedure supports generating either regular WavLM features 
 Example:
 
 ```bash
-python prematch_dataset.py \
+uv run python prematch_dataset.py \
   --librispeech_path /path/to/librispeech/root \
   --out_path /path/where/you/want/outputs/to/go \
   --topk 4 \
@@ -123,7 +140,7 @@ python prematch_dataset.py \
 Newer helper scripts may expose a simplified single-layer option:
 
 ```bash
-python scripts/prematch_dataset.py \
+uv run python scripts/prematch_dataset.py \
   --librispeech_path /path/to/librispeech/root \
   --out_path /path/where/you/want/outputs/to/go \
   --topk 4 \
@@ -140,7 +157,7 @@ To improve training efficiency, this fork can pack the audio and SSL features in
 Example:
 
 ```bash
-python scripts/create_webdataset.py \
+uv run python scripts/create_webdataset.py \
   output_dir=ls-dev-clean_prematch \
   audio_dir=/cfs/collections/librispeech/LibriSpeech/dev-clean/ \
   ssl_dir=librispeech_prematch/dev-clean/ \
@@ -153,31 +170,13 @@ The WebDataset path reduces filesystem overhead, especially on networked filesys
 
 This repository adapts the original [HiFi-GAN](https://github.com/jik876/hifi-gan) training code to work with WavLM features.
 
-The current config-based training entrypoint is:
+The training entrypoint is:
 
 ```bash
-python -m hifigan.train hifigan/config.yaml
+uv run python -m hifigan.train hifigan/config.yaml
 ```
 
 Training can be stopped once it reaches around 2.5M updates, or earlier if audio quality begins to degrade.
-
-For reference, the original explicit-argument training command looked like this:
-
-```bash
-python -m hifigan.train \
-  --audio_root_path /path/to/librispeech/root/ \
-  --feature_root_path /path/to/the/output/of/previous/step/ \
-  --input_training_file data_splits/wavlm-hifigan-train.csv \
-  --input_validation_file data_splits/wavlm-hifigan-valid.csv \
-  --checkpoint_path /path/where/you/want/to/save/checkpoint \
-  --fp16 False \
-  --config hifigan/config_v1_wavlm.json \
-  --stdout_interval 25 \
-  --training_epochs 1800 \
-  --fine_tuning
-```
-
-Prefer the config-based command for the updated training code.
 
 ## Training performance notes
 
@@ -191,39 +190,6 @@ Observed training times:
 | 1x RTX 6000 Ada | `07ccfa0`   | WebDataset, batch size 32, 50 workers   |           120s |
 
 These numbers are workload- and filesystem-dependent, but they show the main bottleneck clearly: data loading can dominate vocoder training. WebDataset helps reduce that goblin.
-
-## Repository structure
-
-```text
-├── data_splits
-│   ├── wavlm-hifigan-train.csv
-│   └── wavlm-hifigan-valid.csv
-├── hifigan
-│   ├── config_v1_wavlm.json
-│   ├── config.yaml
-│   ├── datamodules.py
-│   ├── meldataset.py
-│   ├── mel_utils.py
-│   ├── models.py
-│   ├── train.py
-│   └── utils.py
-├── hubconf.py
-├── knnvc_demo.ipynb
-├── knn-vc.png
-├── knnvc_utils.py
-├── matcher.py
-├── notebooks
-│   └── synthesize_wavlm_features.ipynb
-├── prematch_dataset.py
-├── scripts
-│   ├── create_webdataset.py
-│   └── prematch_dataset.py
-└── wavlm
-    ├── __init__.py
-    ├── load_wavlm.py
-    ├── modules.py
-    └── WavLM.py
-```
 
 ## Acknowledgements
 
