@@ -1,0 +1,55 @@
+[project]
+name = "knn-vc"
+version = "0.1.0"
+description = "Voice conversion with just nearest neighbors, plus modernized HiFi-GAN vocoder training."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+authors = [
+  { name = "Matthew Baas" },
+  { name = "Benjamin van Niekerk" },
+  { name = "Herman Kamper" },
+]
+
+dependencies = [
+  "numpy>=2.4.1",
+  "pandas>=2.3.3",
+  "torch>=2.9.1",
+  "torchcodec>=0.9.1",
+  "torchaudio>=2.9.1",
+  "tqdm>=4.67.1",
+  "tensorboard>=2.20.0",
+  "omegaconf>=2.3.0",
+  "webdataset>=1.0.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/bshall/knn-vc"
+Repository = "https://github.com/perennialtech/knn-vc"
+Paper = "https://arxiv.org/abs/2305.18975"
+Demo = "https://bshall.github.io/knn-vc/"
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.5.1",
+  "ruff>=0.14.11",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+ignore = [
+  "E712",
+  "E731",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
