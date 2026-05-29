@@ -1,12 +1,25 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from torch.nn import AvgPool1d, Conv1d, Conv2d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 
 from .utils import get_padding, init_weights
 
+LOGGER = logging.getLogger(__name__)
 LRELU_SLOPE = 0.1
+
+
+def _remove_weight_norm(module: nn.Module) -> None:
+    try:
+        remove_parametrizations(module, "weight")
+    except ValueError:
+        pass
 
 
 class ResBlock1(torch.nn.Module):
@@ -96,9 +109,9 @@ class ResBlock1(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs1:
-            remove_weight_norm(l)
+            _remove_weight_norm(l)
         for l in self.convs2:
-            remove_weight_norm(l)
+            _remove_weight_norm(l)
 
 
 class ResBlock2(torch.nn.Module):
@@ -140,7 +153,7 @@ class ResBlock2(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs:
-            remove_weight_norm(l)
+            _remove_weight_norm(l)
 
 
 class Generator(torch.nn.Module):
@@ -169,6 +182,7 @@ class Generator(torch.nn.Module):
                 )
             )
 
+        ch = h.upsample_initial_channel
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = h.upsample_initial_channel // (2 ** (i + 1))
@@ -196,6 +210,8 @@ class Generator(torch.nn.Module):
                     xs = self.resblocks[i * self.num_kernels + j](x)
                 else:
                     xs += self.resblocks[i * self.num_kernels + j](x)
+            if xs is None:
+                xs = torch.zeros_like(x)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
@@ -204,20 +220,20 @@ class Generator(torch.nn.Module):
         return x
 
     def remove_weight_norm(self):
-        print("Removing weight norm...")
+        LOGGER.info("Removing weight norm.")
         for l in self.ups:
-            remove_weight_norm(l)
+            _remove_weight_norm(l)
         for l in self.resblocks:
-            l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+            l.remove_weight_norm()  # type: ignore
+        _remove_weight_norm(self.conv_pre)
+        _remove_weight_norm(self.conv_post)
 
 
 class DiscriminatorP(torch.nn.Module):
     def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
         super(DiscriminatorP, self).__init__()
         self.period = period
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(
@@ -315,7 +331,7 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 class DiscriminatorS(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
         super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(Conv1d(1, 128, 15, 1, padding=7)),
@@ -375,35 +391,41 @@ class MultiScaleDiscriminator(torch.nn.Module):
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
-def feature_loss(fmap_r, fmap_g):
-    loss = 0
+def feature_loss(fmap_r, fmap_g) -> Tensor:
+    loss = torch.tensor(
+        0.0, device=fmap_r[0][0].device if fmap_r and fmap_r[0] else None
+    )
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
+            loss = loss + torch.mean(torch.abs(rl - gl))
 
     return loss * 2
 
 
-def discriminator_loss(disc_real_outputs, disc_generated_outputs):
-    loss = 0
+def discriminator_loss(
+    disc_real_outputs, disc_generated_outputs
+) -> tuple[Tensor, list[float], list[float]]:
+    loss = torch.tensor(
+        0.0, device=disc_real_outputs[0].device if disc_real_outputs else None
+    )
     r_losses = []
     g_losses = []
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
-        loss += r_loss + g_loss
+        loss = loss + r_loss + g_loss
         r_losses.append(r_loss.item())
         g_losses.append(g_loss.item())
 
     return loss, r_losses, g_losses
 
 
-def generator_loss(disc_outputs):
-    loss = 0
+def generator_loss(disc_outputs) -> tuple[Tensor, list[Tensor]]:
+    loss = torch.tensor(0.0, device=disc_outputs[0].device if disc_outputs else None)
     gen_losses = []
     for dg in disc_outputs:
         l = torch.mean((1 - dg) ** 2)
         gen_losses.append(l)
-        loss += l
+        loss = loss + l
 
     return loss, gen_losses

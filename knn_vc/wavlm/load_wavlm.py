@@ -3,37 +3,36 @@ import logging
 import torch
 from torchaudio.pipelines import WAVLM_LARGE
 
+from ..devices import resolve_device
+from .features import SPEAKER_INFORMATION_LAYER
 
-def init_wavlm_large(pretrained=True, progress=True, device="cuda"):
-    """
-    Load the WavLM large checkpoint from torchaudio pipelines.
+LOGGER = logging.getLogger(__name__)
+
+
+def init_wavlm_large(
+    pretrained: bool = True, progress: bool = True, device: str | torch.device = "cuda"
+) -> torch.nn.Module:
+    """Load the WavLM large checkpoint from torchaudio pipelines.
     This replaces the legacy unilm/fairseq implementation.
     """
-    if not torch.cuda.is_available() and str(device) != "cpu":
-        logging.getLogger("wavlm").warning(
-            f"Overriding device {device} to cpu since no GPU is available."
+    if not pretrained:
+        raise ValueError(
+            "pretrained=False is not supported for WavLM large because torchaudio "
+            "does not expose an uninitialized WAVLM_LARGE constructor."
         )
-        device = "cpu"
 
-    if pretrained:
-        model = WAVLM_LARGE.get_model()
-    else:
-        model = WAVLM_LARGE.get_model()
+    device = resolve_device(device)
 
-        def reset_parameters(module):
-            reset = getattr(module, "reset_parameters", None)
-            if callable(reset):
-                reset()
+    model = WAVLM_LARGE.get_model(dl_kwargs={"progress": progress})
 
-        model.apply(reset_parameters)
+    setattr(model, "extract_from_layer", SPEAKER_INFORMATION_LAYER)
 
-    model.extract_from_layer = 6
-
-    device = torch.device(device)
     model = model.to(device)
     model.eval()
 
-    print(
-        f"WavLM-Large loaded with {sum([p.numel() for p in model.parameters()]):,d} parameters."
+    LOGGER.info(
+        "WavLM-Large loaded with %s parameters.",
+        f"{sum(p.numel() for p in model.parameters()):,d}",
     )
+
     return model

@@ -45,6 +45,7 @@ knn-vc-train-hifigan = "knn_vc.hifigan.train:main"
 include = ["knn_vc*"]
 
 [tool.setuptools.package-data]
+"knn_vc" = ["py.typed"]
 "knn_vc.hifigan" = ["*.json", "*.yaml"]
 
 [dependency-groups]
@@ -58,6 +59,9 @@ dev = [
   "pytest>=9.0,<10",
   "ruff>=0.14.11",
 ]
+
+[tool.basedpyright]
+exclude = ["**/*.ipynb"]
 
 [tool.uv]
 package = true

@@ -1,8 +1,12 @@
 import glob
+import logging
 import os
+from typing import Any
 
 import torch
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
+
+LOGGER = logging.getLogger(__name__)
 
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -23,7 +27,7 @@ def get_padding(kernel_size, dilation=1):
 
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)
-    print("Loading '{}'".format(filepath))
+    LOGGER.info("Loading %s", filepath)
     try:
         checkpoint_dict = torch.load(
             filepath,
@@ -32,7 +36,7 @@ def load_checkpoint(filepath, device):
         )
     except TypeError:
         checkpoint_dict = torch.load(filepath, map_location=device)
-    print("Complete.")
+    LOGGER.info("Loaded %s", filepath)
     return checkpoint_dict
 
 
@@ -44,7 +48,16 @@ def scan_checkpoint(cp_dir, prefix):
     return sorted(cp_list)[-1]
 
 
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
+class AttrDict(dict[str, Any]):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value

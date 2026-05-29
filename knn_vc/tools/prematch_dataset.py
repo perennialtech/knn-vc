@@ -39,12 +39,14 @@ from torch import Tensor
 from torchaudio.pipelines import WAVLM_LARGE
 from tqdm import tqdm
 
+from knn_vc.devices import resolve_device
+from knn_vc.wavlm import extract_wavlm_layers, validate_wavlm_layer
+
 TARGET_SAMPLE_RATE = 16_000
 DOWNSAMPLE_FACTOR = 320
 
 MIN_VECTORS_FOR_PREMATCH = 9_000  # roughly 3 minutes
 MAX_VECTORS_FOR_PREMATCH = 24_000  # roughly 8 minutes
-MAX_WAVLM_LAYER = 24
 
 LOGGER = logging.getLogger("prematch_dataset")
 
@@ -85,35 +87,10 @@ class FeatureExtractor:
         layer_set = set(layers)
 
         for layer in layer_set:
-            validate_layer("layer", layer)
+            validate_wavlm_layer(layer)
 
         waveform = self.load_waveform(path)
-        selected: dict[int, Tensor] = {}
-
-        max_transformer_layer = max(
-            (layer for layer in layer_set if layer > 0), default=0
-        )
-
-        if max_transformer_layer:
-            transformer_features, _ = self.wavlm.extract_features(
-                waveform,
-                num_layers=max_transformer_layer,
-            )
-
-            for layer in layer_set:
-                if layer > 0:
-                    selected[layer] = transformer_features[layer - 1].squeeze(0)
-
-        if 0 in layer_set:
-            conv_features, _ = self.wavlm.feature_extractor(waveform, None)
-            projection = self.wavlm.encoder.feature_projection(conv_features)
-
-            if isinstance(projection, tuple):
-                projection = projection[0]
-
-            selected[0] = projection.squeeze(0)
-
-        return selected
+        return extract_wavlm_layers(self.wavlm, waveform, layer_set)
 
     def load_waveform(self, path: Path) -> Tensor:
         waveform, sample_rate = torchaudio.load(path)
@@ -215,13 +192,6 @@ def make_df(root_path: Path, ext: str = ".flac") -> pd.DataFrame:
     LOGGER.info("Loaded %s files", len(files))
 
     return pd.DataFrame({"path": files, "speaker": speakers})
-
-
-def validate_layer(name: str, layer: int) -> None:
-    """Validate a user-facing WavLM layer index."""
-
-    if not 0 <= layer <= MAX_WAVLM_LAYER:
-        raise ValueError(f"{name} must be between 0 and {MAX_WAVLM_LAYER}, got {layer}")
 
 
 def validate_positive(name: str, value: int) -> None:
@@ -337,7 +307,7 @@ def speaker_items(
     items: list[WorkItem] = []
 
     for row in group.itertuples(index=False):
-        source = Path(row.path)
+        source = Path(getattr(row, "path"))
         rel_path = source.relative_to(source_root)
         target = (out_path / rel_path).with_suffix(".pt")
 
@@ -451,7 +421,7 @@ def extract(
     prematcher = PreMatcher(topk=topk, distance_batch_size=distance_batch_size)
     grouped = df.groupby("speaker", sort=True)
 
-    for speaker, group in tqdm(grouped, total=df["speaker"].nunique()):
+    for speaker, group in tqdm(grouped, total=int(df["speaker"].nunique())):
         LOGGER.info("Processing speaker %s with %s utterances", speaker, len(group))
 
         items = speaker_items(
@@ -486,8 +456,8 @@ def main(args: argparse.Namespace) -> None:
 
     configure_logging()
 
-    validate_layer("synthesis_layer", args.synthesis_layer)
-    validate_layer("matching_layer", args.matching_layer)
+    validate_wavlm_layer(args.synthesis_layer, "synthesis_layer")
+    validate_wavlm_layer(args.matching_layer, "matching_layer")
     validate_positive("topk", args.topk)
     validate_positive("distance_batch_size", args.distance_batch_size)
 
@@ -497,6 +467,7 @@ def main(args: argparse.Namespace) -> None:
     source_root = Path(args.path)
     out_path = Path(args.out_path)
     device = torch.device(args.device)
+    device = resolve_device(args.device)
 
     LOGGER.info("Starting run with args %s", args)
 

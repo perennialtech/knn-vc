@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import random
 from collections import OrderedDict
@@ -21,6 +22,7 @@ from torch import Tensor
 # The keys include all parameters that affect the generated object.
 mel_basis: Dict[Tuple[Any, ...], Tensor] = {}
 hann_window: Dict[Tuple[Any, ...], Tensor] = {}
+LOGGER = logging.getLogger(__name__)
 
 
 def load_wav(full_path):
@@ -208,9 +210,9 @@ def mel_spectrogram(
     max_value = torch.max(y)
 
     if min_value < -1.0:
-        print(f"min value is {min_value.item()}")
+        LOGGER.warning("min value is %s", min_value.item())
     if max_value > 1.0:
-        print(f"max value is {max_value.item()}")
+        LOGGER.warning("max value is %s", max_value.item())
 
     device_str = str(y.device)
     dtype_str = str(y.dtype)
@@ -280,7 +282,7 @@ def get_dataset_filelist(a):
     return train_df, valid_df
 
 
-class MelDataset(torch.utils.data.Dataset):
+class MelDataset(torch.utils.data.Dataset[Any]):
     def __init__(
         self,
         training_files,

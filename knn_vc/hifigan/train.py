@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ from .mel_utils import LogMelSpectrogram
 from .models import (Generator, MultiPeriodDiscriminator,
                      MultiScaleDiscriminator, discriminator_loss, feature_loss,
                      generator_loss)
-from .utils import AttrDict, load_checkpoint, scan_checkpoint
+from .utils import load_checkpoint, scan_checkpoint
 
 torch.backends.cudnn.benchmark = True
 
@@ -35,7 +36,7 @@ def get_commit_hash() -> str:
 
 
 class Trainer:
-    def __init__(self, config: AttrDict, logger: logging.Logger):
+    def __init__(self, config: Any, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.tb_logger = SummaryWriter(config.ckpt_path)
@@ -49,12 +50,20 @@ class Trainer:
         # check if ckpt folder already exists and retrieve checkpoints
         os.makedirs(config.ckpt_path, exist_ok=True)
         logger.info(f"checkpoints directory: {config.ckpt_path}")
+
+        cp_g = None
+        cp_do = None
         if os.path.isdir(config.ckpt_path):
             cp_g = scan_checkpoint(config.ckpt_path, "g_")
             cp_do = scan_checkpoint(config.ckpt_path, "do_")
 
         # if ckpt folder is new, start training from scratch
         if cp_g is None or cp_do is None:
+            if getattr(config, "resume", False):
+                raise FileNotFoundError(
+                    f"No complete generator/discriminator checkpoint pair found in {config.ckpt_path}"
+                )
+
             self.steps = 0
             state_dict_do = None
             self.last_epoch = -1
@@ -74,12 +83,12 @@ class Trainer:
         self.optim_g = torch.optim.AdamW(
             self.generator.parameters(),
             config.adamw.learning_rate,
-            betas=[config.adamw.adam_b1, config.adamw.adam_b2],
+            betas=(config.adamw.adam_b1, config.adamw.adam_b2),
         )
         self.optim_d = torch.optim.AdamW(
             itertools.chain(self.msd.parameters(), self.mpd.parameters()),
             config.adamw.learning_rate,
-            betas=[config.adamw.adam_b1, config.adamw.adam_b2],
+            betas=(config.adamw.adam_b1, config.adamw.adam_b2),
         )
 
         # load optimizer checkpoints if appropriate
@@ -113,9 +122,6 @@ class Trainer:
             config.mel.fmin,
             config.mel.fmax,
         ).to(self.device)
-
-        # start training
-        self.train()
 
     def train(self):
         self.generator.train()
@@ -306,15 +312,16 @@ class Trainer:
         )
 
 
-def override_with_args(config: DictConfig, args: dict):
+def override_with_args(config: Any, args: list[str]) -> None:
     """
-    Update the config with the passed arguments. The new value is casted to the type of
-    the existing value. If that fails, an error is raised.
+    Update existing config keys from key-value CLI pairs.
+
+    Values are parsed by OmegaConf, so booleans, numbers, nulls, lists, and strings
+    follow the same rules as config files.
     """
 
-    def check_key_existence(config: DictConfig, key: str, full_key: str):
-        """Raise an error if the key does not exist in the cofig."""
-        if key not in config:
+    def check_key_existence(sub_config: DictConfig, key: str, full_key: str) -> None:
+        if not isinstance(sub_config, DictConfig) or key not in sub_config:
             raise KeyError(
                 f"Subkey '{key}' not found in config for override '{full_key}'"
             )
@@ -324,38 +331,50 @@ def override_with_args(config: DictConfig, args: dict):
             "The number of config arguments must be even (key-value pairs)"
         )
 
-    # cast args to a dict
-    args_dict = dict()
-    for key_idx in range(0, len(args), 2):
-        args_dict[args[key_idx]] = args[key_idx + 1]
-
-    for key, value in args_dict.items():
+    for key, value in zip(args[0::2], args[1::2]):
         keys = key.split(".")
 
-        # iterate over the keys that serve as directories
         sub_config = config
         for sub_key in keys[:-1]:
             check_key_existence(sub_config, sub_key, key)
             sub_config = sub_config[sub_key]
 
-        # change the value of the last key
-        last_key = keys[-1]
-        check_key_existence(sub_config, last_key, key)
-        if type(sub_config[last_key]) is not type(value):
-            old_type = type(sub_config[last_key])
-            try:
-                value = old_type(value)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to cast override for '{key}' to {old_type}: {e}"
-                )
-        sub_config[last_key] = value
+        check_key_existence(sub_config, keys[-1], key)
+
+        parsed_override = OmegaConf.from_dotlist([f"{key}={value}"])
+        parsed_value = OmegaConf.select(parsed_override, key)
+        OmegaConf.update(config, key, parsed_value, merge=False)
+
+
+def resolve_run_directory(config: Any, run_dir: str | None, resume: bool) -> str:
+    if resume:
+        if run_dir is None:
+            raise RuntimeError("--resume requires --run-dir")
+
+        if not os.path.isdir(run_dir):
+            raise FileNotFoundError(
+                f"Cannot resume because run directory does not exist: {run_dir}"
+            )
+
+        return run_dir
+
+    if run_dir is None:
+        return os.path.join(config.checkpoint_dir, str(int(time.time())))
+
+    if os.path.isfile(run_dir) or (os.path.isdir(run_dir) and os.listdir(run_dir)):
+        raise FileExistsError(
+            f"Run directory already exists and is not empty: {run_dir}"
+        )
+
+    return run_dir
 
 
 def main(argv: list[str] | None = None):
 
     parser = argparse.ArgumentParser()
     parser.add_argument("config")
+    parser.add_argument("--run-dir", default=None)
+    parser.add_argument("--resume", action="store_true")
 
     # load args and config overrides
     args, config_overrides = parser.parse_known_args(argv)
@@ -364,11 +383,15 @@ def main(argv: list[str] | None = None):
 
     # define logging directory
     config.ckpt_path = os.path.join(config.checkpoint_dir, str(int(time.time())))
+    config.ckpt_path = resolve_run_directory(config, args.run_dir, args.resume)
     os.makedirs(config.ckpt_path, exist_ok=True)
 
     # add args to config
     for key, value in vars(args).items():
-        config[key] = value
+        if isinstance(config, dict):
+            config[key] = value
+        else:
+            OmegaConf.update(config, key, value, merge=False)
 
     # dump config with commit hash
     config.commit_hash = get_commit_hash()
@@ -376,6 +399,7 @@ def main(argv: list[str] | None = None):
 
     # create logger
     logger = logging.getLogger("train")
+    logger.handlers.clear()
     handler = logging.FileHandler(os.path.join(config.ckpt_path, "train.log"))
     handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
@@ -397,7 +421,11 @@ def main(argv: list[str] | None = None):
         config.device = "cpu"
         config.fp16 = False
 
-    Trainer(config, logger)
+    config.commit_hash = get_commit_hash()
+    OmegaConf.save(config, os.path.join(config.ckpt_path, "config.yaml"))
+
+    trainer = Trainer(config, logger)
+    trainer.train()
 
 
 if __name__ == "__main__":

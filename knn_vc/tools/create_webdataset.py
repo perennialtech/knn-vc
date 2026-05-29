@@ -1,5 +1,5 @@
 import argparse
-import os
+from pathlib import Path
 
 import webdataset as wds
 from tqdm import tqdm
@@ -11,31 +11,41 @@ def prepare_shards(
     """
     Creates multiple webdataset shards by pairing SSL features and audio files.
     """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if n_tars < 1:
+        raise ValueError(f"n_tars must be at least 1, got {n_tars}")
+
+    output_path = Path(output_dir)
+    audio_root = Path(audio_dir)
+    ssl_root = Path(ssl_dir)
+    normalized_ext = ext if ext.startswith(".") else f".{ext}"
+    sample_ext = normalized_ext.lstrip(".")
+
+    output_path.mkdir(parents=True, exist_ok=True)
 
     # gather all valid pairs
     file_pairs = []
-    for folder, _, files in tqdm(os.walk(ssl_dir), desc="Searching for file pairs..."):
-        for f in files:
-            if not f.endswith(".pt"):
-                continue
+    ssl_paths = sorted(ssl_root.rglob("*.pt"))
 
-            ssl_path = os.path.join(folder, f)
-            audio_path = ssl_path.replace(ssl_dir, audio_dir).replace(".pt", ext)
+    for ssl_path in tqdm(ssl_paths, desc="Searching for file pairs..."):
+        rel_path = ssl_path.relative_to(ssl_root)
+        audio_path = (audio_root / rel_path).with_suffix(normalized_ext)
 
-            if os.path.exists(audio_path):
-                # We store the base name (key) and the full paths
-                key = f.replace(".pt", "")
-                file_pairs.append((key, ssl_path, audio_path))
-            else:
-                print(f"Warning: Audio missing for {ssl_path}")
+        if audio_path.exists():
+            key = rel_path.with_suffix("").as_posix()
+            file_pairs.append((key, ssl_path, audio_path))
+        else:
+            print(f"Warning: Audio missing for {ssl_path}")
+
+    if not file_pairs:
+        raise FileNotFoundError(
+            f"No matching {sample_ext} audio files found for .pt files under {ssl_root}"
+        )
 
     # create the pattern for filenames (e.g., shard-00001.tar)
     print(f"{len(file_pairs)} samples will be written across {n_tars} shards")
     writers = [
-        wds.TarWriter(os.path.join(output_dir, f"shard-{i:05d}.tar"))
-        for i in range(n_tars)
+        wds.TarWriter(str(output_path / f"shard-{i:05d}.tar"))
+        for i in range(n_tars)  # type: ignore
     ]
 
     # distribute samples across writers
@@ -50,10 +60,10 @@ def prepare_shards(
             audio_data = f.read()
 
         # WebDataset uses the keys to group files into a single sample
-        sample = {"__key__": key, "pt": ssl_data, ext.lstrip("."): audio_data}
+        sample = {"__key__": key, "pt": ssl_data, sample_ext: audio_data}
         writer.write(sample)
 
-    # close  writers to finalize the tar files
+    # close writers to finalize the tar files
     for writer in writers:
         writer.close()
 

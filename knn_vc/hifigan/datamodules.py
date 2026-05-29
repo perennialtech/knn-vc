@@ -4,10 +4,10 @@ import os
 import random
 from dataclasses import dataclass
 from io import BytesIO
+from typing import Any
 
 import torch
 import webdataset as wds
-from omegaconf import DictConfig
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
@@ -15,7 +15,10 @@ from torchcodec.decoders import AudioDecoder
 
 
 def decode_pt(pt: bytes) -> Tensor:
-    return torch.load(BytesIO(pt), weights_only=False)
+    try:
+        return torch.load(BytesIO(pt), weights_only=True)
+    except TypeError:
+        return torch.load(BytesIO(pt))
 
 
 class WdsAudioDecoder:
@@ -24,10 +27,18 @@ class WdsAudioDecoder:
 
     def __call__(self, audio: bytes) -> Tensor:
         encoded_data = torch.frombuffer(audio, dtype=torch.uint8).clone()
-        return AudioDecoder(encoded_data, sample_rate=self.sr).get_all_samples().data
+        samples = AudioDecoder(encoded_data, sample_rate=self.sr).get_all_samples().data
+
+        if samples.dim() == 1:
+            samples = samples.unsqueeze(0)
+
+        if samples.shape[0] > 1:
+            samples = samples.mean(dim=0, keepdim=True)
+
+        return samples.contiguous()
 
 
-def is_not_metadata(sample: str) -> bool:
+def is_not_metadata(sample: dict[str, Any]) -> bool:
     fname = sample["__key__"].split("/")[-1]
     if not fname:
         return False
@@ -41,10 +52,10 @@ def is_not_metadata(sample: str) -> bool:
 
 def create_dataloader(
     tar_dir: str,
-    config: DictConfig,
+    config: Any,
     logger: logging.Logger,
     shuffle: bool = True,
-) -> DataLoader:
+) -> DataLoader[Any]:
     tar_paths = sorted(
         os.path.join(tar_dir, f) for f in os.listdir(tar_dir) if f.endswith(".tar")
     )
@@ -55,11 +66,11 @@ def create_dataloader(
         f"Creating dataloader with {len(tar_paths)} tar files and shuffle={shuffle}"
     )
     dataset = (
-        wds.WebDataset(tar_paths)
+        wds.WebDataset(tar_paths)  # type: ignore
         .select(is_not_metadata)
         .decode(
-            wds.handle_extension("pt", decode_pt),
-            wds.handle_extension(config.audio_ext, WdsAudioDecoder(config.sample_rate)),
+            wds.handle_extension("pt", decode_pt),  # type: ignore
+            wds.handle_extension(config.audio_ext, WdsAudioDecoder(config.sample_rate)),  # type: ignore
         )
     )
     if shuffle:
@@ -103,7 +114,7 @@ class Collator:
         self.fps = math.ceil(segment_size / hop_size)
         self.hop_size = hop_size
 
-    def __call__(self, batch: list[dict]) -> DataBatch:
+    def __call__(self, batch: list[dict[str, Any]]) -> DataBatch:
         all_feats, all_audios, all_fnames = list(), list(), list()
         for item in batch:
             feats, audio = self.segment(item["pt"], item[self.audio_ext])
@@ -126,21 +137,28 @@ class Collator:
 
         Returns:
             - feats: shape (self.fps, vec_dim)
-            - audio: shape(1, self.fps * self.hop_size = ~self.segment_size)
+            - audio: shape (1, self.fps * self.hop_size)
         """
-        if audio.shape[1] >= self.segment_size:
-            start = random.randint(0, feats.shape[0] - self.fps - 1)
-            feats = feats[start : start + self.fps, :]
-            audio = audio[
-                :,
-                start * self.hop_size : (start + self.fps) * self.hop_size,
-            ]
-        else:
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+
+        target_samples = self.fps * self.hop_size
+        max_start_by_feats = max(0, feats.shape[0] - self.fps)
+        max_start_by_audio = max(0, (audio.shape[1] - target_samples) // self.hop_size)
+        max_start = min(max_start_by_feats, max_start_by_audio)
+        start = random.randint(0, max_start) if max_start > 0 else 0
+
+        feats = feats[start : start + self.fps, :]
+        audio = audio[:, start * self.hop_size : start * self.hop_size + target_samples]
+
+        if feats.shape[0] < self.fps:
             feats = torch.nn.functional.pad(
                 feats, (0, 0, 0, self.fps - feats.shape[0]), "constant"
             )
+
+        if audio.shape[1] < target_samples:
             audio = torch.nn.functional.pad(
-                audio, (0, (self.fps * self.hop_size) - audio.shape[1]), "constant"
+                audio, (0, target_samples - audio.shape[1]), "constant"
             )
 
         return feats, audio
