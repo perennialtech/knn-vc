@@ -14,8 +14,7 @@ another.
 
 Layer numbering:
 
-    0      convolutional projection layer
-    1-24   WavLM transformer layers
+    1-24   one-based WavLM transformer outputs, matching the original kNN-VC/WavLM convention
 
 If torchcodec or ffmpeg is not available, this version uses torchaudio instead.
 """

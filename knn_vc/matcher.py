@@ -18,6 +18,8 @@ from .wavlm import SPEAKER_INFORMATION_LAYER, extract_wavlm_layers
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_FEATURE_LOUDNESS_CEILING_DB: float | None = None
+
 
 def _validate_feature_matrix(
     name: str,
@@ -70,6 +72,25 @@ def fast_cosine_dist(
     return 1.0 - source @ pool.T
 
 
+def attenuate_loud_waveform(
+    waveform: Tensor,
+    sample_rate: int,
+    loudness_ceiling_db: float | None = DEFAULT_FEATURE_LOUDNESS_CEILING_DB,
+) -> Tensor:
+    """Optionally attenuate audio that is louder than the feature-extraction ceiling."""
+
+    if loudness_ceiling_db is None:
+        return waveform
+
+    loudness = torchaudio.functional.loudness(waveform, sample_rate)
+    loudness_db = float(loudness.item())
+
+    if not math.isfinite(loudness_db) or loudness_db <= loudness_ceiling_db:
+        return waveform
+
+    return torchaudio.functional.gain(waveform, loudness_ceiling_db - loudness_db)
+
+
 class KNeighborsVC(nn.Module):
     """kNN-VC matcher and vocoder wrapper."""
 
@@ -105,6 +126,7 @@ class KNeighborsVC(nn.Module):
         wavs: Sequence[str | Path | Tensor],
         layer: int = SPEAKER_INFORMATION_LAYER,
         vad_trigger_level: float = 7.0,
+        feature_loudness_ceiling_db: float | None = DEFAULT_FEATURE_LOUDNESS_CEILING_DB,
     ) -> Tensor:
         """Return concatenated WavLM features for the reference utterances."""
 
@@ -116,6 +138,7 @@ class KNeighborsVC(nn.Module):
                 wav,
                 layer=layer,
                 vad_trigger_level=vad_trigger_level,
+                feature_loudness_ceiling_db=feature_loudness_ceiling_db,
             ).cpu()
             for wav in wavs
         ]
@@ -144,6 +167,7 @@ class KNeighborsVC(nn.Module):
         sample_rate: int | None = None,
         layer: int = SPEAKER_INFORMATION_LAYER,
         vad_trigger_level: float = 0.0,
+        feature_loudness_ceiling_db: float | None = DEFAULT_FEATURE_LOUDNESS_CEILING_DB,
     ) -> Tensor:
         """Returns features of `path` waveform as a tensor of shape (seq_len, dim), optionally perform VAD trimming
         on start/end with `vad_trigger_level`.
@@ -186,6 +210,8 @@ class KNeighborsVC(nn.Module):
             # )
             x = waveform_end_trim
 
+        x = attenuate_loud_waveform(x, sr, feature_loudness_ceiling_db)
+
         # extract the representation of each layer
         wav_input_16khz = x.to(self.device)
         features = extract_wavlm_layers(self.wavlm, wav_input_16khz, {layer})
@@ -199,11 +225,17 @@ class KNeighborsVC(nn.Module):
         matching_set: Tensor,
         synth_set: Tensor | None = None,
         topk: int = 4,
-        tgt_loudness_db: float | None = -16,
+        tgt_loudness_db: float | None = None,
         target_duration: float | None = None,
         device: str | torch.device | None = None,
     ) -> Tensor:
-        """Perform kNN feature matching and vocode the converted waveform."""
+        """
+        Perform kNN feature matching and vocode the converted waveform.
+
+        Loudness normalization is opt-in. Passing `tgt_loudness_db` applies a
+        final gain stage, but no limiter, so callers should choose that target
+        deliberately.
+        """
 
         if topk < 1:
             raise ValueError(f"topk must be at least 1, got {topk}")
@@ -277,7 +309,6 @@ class KNeighborsVC(nn.Module):
             prediction[None],
             self.h.sampling_rate,
         )
-        gain_db = float(tgt_loudness_db - src_loudness.item())
         src_loudness_db = float(src_loudness.item())
 
         if not math.isfinite(src_loudness_db):

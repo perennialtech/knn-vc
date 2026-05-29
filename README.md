@@ -89,6 +89,8 @@ query_seq = knn_vc.get_features(src_wav_path)
 matching_set = knn_vc.get_matching_set(ref_wav_paths)
 ```
 
+By default, feature extraction feeds waveform levels to WavLM unchanged, matching the original kNN-VC inference path. To deliberately attenuate very hot input audio before WavLM, pass a ceiling such as `feature_loudness_ceiling_db=-24` to `get_features` and `get_matching_set`.
+
 Perform kNN matching and vocoding:
 
 ```python
@@ -96,6 +98,12 @@ out_wav = knn_vc.match(query_seq, matching_set, topk=4)
 ```
 
 `out_wav` is a `(T,)` tensor containing the converted 16 kHz waveform, using `k=4` for kNN.
+
+By default, kNN-VC preserves the vocoder output amplitude and does not apply an extra output gain stage. To normalize the final waveform deliberately, pass a target loudness:
+
+```python
+out_wav = knn_vc.match(query_seq, matching_set, topk=4, tgt_loudness_db=-16)
+```
 
 The target speaker from `ref_wav_paths` can be any speaker, but the reference audio should be clean speech from the desired target speaker. Longer cumulative reference duration generally improves quality, though the improvement diminishes beyond roughly 5 minutes of reference speech.
 
@@ -146,6 +154,8 @@ docker compose up --build
 
 Once running, navigate to `http://localhost:8000/docs` in your browser to view the interactive API documentation and test the available endpoints.
 
+`POST /convert` accepts optional form fields for `topk`, `feature_loudness_ceiling_db`, and `tgt_loudness_db`. `feature_loudness_ceiling_db` is disabled by default so WavLM sees the same waveform levels as upstream kNN-VC. Set it to a value such as `-24` only when you deliberately want input-side attenuation. Omit `tgt_loudness_db` to return the model output without an extra output gain stage, or set it to a value such as `-16` to apply final loudness normalization.
+
 ## Training
 
 We follow the typical encoder-converter-vocoder setup for voice conversion. The kNN matching procedure acts as the converter, while HiFi-GAN is trained as the vocoder over WavLM features.
@@ -174,7 +184,7 @@ uv run knn-vc-prematch \
   --prematch
 ```
 
-Use `--synthesis_layer 6 --matching_layer 6` for the original single-layer recipe.
+Use `--synthesis_layer 6 --matching_layer 6` for the original single-layer recipe. Layer numbers are one-based WavLM transformer outputs, matching the original kNN-VC/WavLM convention. So layer 6 means the sixth transformer block output.
 
 #### 2. Create WebDataset shards
 

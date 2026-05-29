@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
-from knn_vc import load_knn_vc
+from knn_vc import DEFAULT_FEATURE_LOUDNESS_CEILING_DB, load_knn_vc
 
 DATA_DIR = Path(os.getenv("KNN_VC_DATA_DIR", "./data"))
 VOICES_DIR = DATA_DIR / "voices"
@@ -94,6 +94,11 @@ def cleanup_files(*paths: str):
 def convert(
     voice_id: str = Form(...),
     file: UploadFile = File(...),
+    topk: int = Form(4),
+    tgt_loudness_db: float | None = Form(None),
+    feature_loudness_ceiling_db: float | None = Form(
+        DEFAULT_FEATURE_LOUDNESS_CEILING_DB
+    ),
 ):
     voice_id = Path(voice_id).name
     voice_dir = VOICES_DIR / voice_id
@@ -112,12 +117,26 @@ def convert(
     os.close(out_fd)
 
     try:
-        query_seq = model.get_features(src_path)
-        matching_set = model.get_matching_set(ref_wav_paths)
+        query_seq = model.get_features(
+            src_path,
+            feature_loudness_ceiling_db=feature_loudness_ceiling_db,
+        )
+        matching_set = model.get_matching_set(
+            ref_wav_paths,
+            feature_loudness_ceiling_db=feature_loudness_ceiling_db,
+        )
 
-        out_wav = model.match(query_seq, matching_set, topk=4)
+        out_wav = model.match(
+            query_seq,
+            matching_set,
+            topk=topk,
+            tgt_loudness_db=tgt_loudness_db,
+        )
 
         torchaudio.save(out_path, out_wav.unsqueeze(0), 16000)
+    except ValueError as e:
+        cleanup_files(src_path, out_path)
+        raise HTTPException(400, str(e))
     except Exception as e:
         cleanup_files(src_path, out_path)
         raise HTTPException(500, str(e))

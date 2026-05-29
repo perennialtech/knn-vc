@@ -1,33 +1,50 @@
 import json
+import math
 
 import pytest
 import torch
+import torchaudio
 
 import knn_vc
-from knn_vc import (KNeighborsVC, fast_cosine_dist, load_hifigan_config,
-                    load_hifigan_wavlm, load_knn_vc, load_wavlm_large)
+from knn_vc import (DEFAULT_FEATURE_LOUDNESS_CEILING_DB, KNeighborsVC,
+                    fast_cosine_dist, load_hifigan_config, load_hifigan_wavlm,
+                    load_knn_vc, load_wavlm_large)
 from knn_vc.hifigan.utils import AttrDict
+from knn_vc.matcher import attenuate_loud_waveform
 
 
 class _FakeHiFiGAN(torch.nn.Module):
+    def __init__(self, amplitude: float = 0.0):
+        super().__init__()
+        self.amplitude = amplitude
+
     def forward(self, x):
-        return torch.zeros(x.shape[0], 1, x.shape[1] * 320, device=x.device)
+        samples = x.shape[1] * 320
+
+        if self.amplitude == 0.0:
+            return torch.zeros(x.shape[0], 1, samples, device=x.device)
+
+        time = torch.arange(samples, device=x.device, dtype=x.dtype)
+        wave = self.amplitude * torch.sin(math.tau * 440.0 * time / 16_000.0)
+        return wave.view(1, 1, samples).expand(x.shape[0], 1, samples)
 
 
 class _FakeWavLM(torch.nn.Module):
     pass
 
 
-def _fake_knn_vc() -> KNeighborsVC:
+def _fake_knn_vc(hifigan: torch.nn.Module | None = None) -> KNeighborsVC:
     return KNeighborsVC(
         _FakeWavLM(),
-        _FakeHiFiGAN(),
+        hifigan if hifigan is not None else _FakeHiFiGAN(),
         AttrDict({"sampling_rate": 16000, "hop_size": 320, "hubert_dim": 2}),
         device="cpu",
     )
 
 
 def test_public_api_exports_core_symbols():
+    assert "DEFAULT_FEATURE_LOUDNESS_CEILING_DB" in knn_vc.__all__
+    assert DEFAULT_FEATURE_LOUDNESS_CEILING_DB is None
     assert "KNeighborsVC" in knn_vc.__all__
     assert "load_knn_vc" in knn_vc.__all__
     assert "fast_cosine_dist" in knn_vc.__all__
@@ -134,6 +151,39 @@ def test_match_target_duration_returns_requested_sample_count():
     )
 
     assert out.shape == (1600,)
+
+
+def test_match_preserves_vocoder_amplitude_by_default():
+    model = _fake_knn_vc(_FakeHiFiGAN(amplitude=0.01))
+
+    out = model.match(
+        torch.ones(2, 2),
+        torch.ones(4, 2),
+        topk=2,
+    )
+
+    assert out.abs().max().item() == pytest.approx(0.01, rel=0.05)
+
+
+def test_attenuate_loud_waveform_default_is_noop():
+    waveform = torch.ones(1, 1600) * 0.5
+
+    assert torch.equal(attenuate_loud_waveform(waveform, 16_000), waveform)
+
+
+def test_attenuate_loud_waveform_only_reduces_audio_above_ceiling():
+    sample_rate = 16_000
+    time = torch.arange(sample_rate, dtype=torch.float32) / sample_rate
+    hot = (0.5 * torch.sin(math.tau * 440.0 * time)).unsqueeze(0)
+    quiet = (0.001 * torch.sin(math.tau * 440.0 * time)).unsqueeze(0)
+
+    cooled = attenuate_loud_waveform(hot, sample_rate, -30.0)
+    unchanged = attenuate_loud_waveform(quiet, sample_rate, -10.0)
+
+    assert torchaudio.functional.loudness(cooled, sample_rate).item() == pytest.approx(
+        -30.0, abs=0.1
+    )
+    assert torch.allclose(unchanged, quiet)
 
 
 def test_match_device_uses_device_resolver():

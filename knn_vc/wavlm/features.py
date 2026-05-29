@@ -1,16 +1,13 @@
 from collections.abc import Iterable
-
 import torch
 from torch import Tensor
 
 MAX_WAVLM_LAYER = 24
 SPEAKER_INFORMATION_LAYER = 6
 
-
 def validate_wavlm_layer(layer: int, name: str = "layer") -> None:
-    if not 0 <= layer <= MAX_WAVLM_LAYER:
-        raise ValueError(f"{name} must be between 0 and {MAX_WAVLM_LAYER}, got {layer}")
-
+    if not 1 <= layer <= MAX_WAVLM_LAYER:
+        raise ValueError(f"{name} must be between 1 and {MAX_WAVLM_LAYER}, got {layer}")
 
 def _sorted_unique_layers(layers: Iterable[int]) -> tuple[int, ...]:
     layer_ids = tuple(sorted(set(layers)))
@@ -20,7 +17,6 @@ def _sorted_unique_layers(layers: Iterable[int]) -> tuple[int, ...]:
 
     return layer_ids
 
-
 def _validate_single_waveform(waveform: Tensor) -> None:
     if waveform.dim() != 2 or waveform.shape[0] != 1:
         raise ValueError(
@@ -28,23 +24,21 @@ def _validate_single_waveform(waveform: Tensor) -> None:
             f"got {tuple(waveform.shape)}"
         )
 
-
-def _project_convolutional_features(wavlm, waveform: Tensor) -> Tensor:
-    conv_features, _ = wavlm.feature_extractor(waveform, None)
-    projected = wavlm.encoder.feature_projection(conv_features)
-
-    if isinstance(projected, tuple):
-        projected = projected[0]
-
-    return projected.squeeze(0)
-
-
 @torch.inference_mode()
 def extract_wavlm_layers(
     wavlm,
     waveform: Tensor,
     layers: Iterable[int],
 ) -> dict[int, Tensor]:
+    """
+    Return selected one-based transformer-layer features.
+
+    The released kNN-VC vocoders were trained with the original WavLM code,
+    where `output_layer=6` returns the sixth transformer block output. Torchaudio
+    returns those transformer outputs in a zero-based list, so public layer id 6
+    maps to `transformer_features[5]`.
+    """
+
     _validate_single_waveform(waveform)
 
     layer_ids = _sorted_unique_layers(layers)
@@ -52,20 +46,13 @@ def extract_wavlm_layers(
     if not layer_ids:
         return {}
 
+    transformer_features, _ = wavlm.extract_features(
+        waveform,
+        num_layers=max(layer_ids),
+    )
+
     selected: dict[int, Tensor] = {}
-    max_transformer_layer = max((layer for layer in layer_ids if layer > 0), default=0)
-
-    if max_transformer_layer:
-        transformer_features, _ = wavlm.extract_features(
-            waveform,
-            num_layers=max_transformer_layer,
-        )
-
-        for layer in layer_ids:
-            if layer > 0:
-                selected[layer] = transformer_features[layer - 1].squeeze(0)
-
-    if 0 in layer_ids:
-        selected[0] = _project_convolutional_features(wavlm, waveform)
+    for layer in layer_ids:
+        selected[layer] = transformer_features[layer - 1].squeeze(0)
 
     return selected
